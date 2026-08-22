@@ -238,6 +238,7 @@ struct ParsedRequest {
     instructions: Option<String>,
     tools: Vec<ToolDefinition>,
     prompt_cache_key: Option<String>,
+    previous_response_id: Option<String>,
 }
 
 impl WireRequest {
@@ -348,6 +349,7 @@ impl WireRequest {
             instructions: self.instructions,
             tools,
             prompt_cache_key: self.prompt_cache_key,
+            previous_response_id: self.previous_response_id,
         })
     }
 }
@@ -633,9 +635,13 @@ where
                     session: Mutex::new(session),
                     last_input: Mutex::new(Vec::new()),
                     last_output: Mutex::new(Vec::new()),
+                    last_response_id: Mutex::new(None),
                     failed: AtomicBool::new(false),
                 });
-                (StatusCode::OK, spawn_operation(state, request.items))
+                (
+                    StatusCode::OK,
+                    spawn_operation(state, request.items, request.previous_response_id),
+                )
             }
             Err(error) => (StatusCode::BAD_REQUEST, error_receiver(error)),
         },
@@ -706,6 +712,7 @@ struct ConnectionState<S> {
     session: Mutex<Session<S>>,
     last_input: Mutex<Vec<ResponseItem>>,
     last_output: Mutex<Vec<ResponseItem>>,
+    last_response_id: Mutex<Option<String>>,
     failed: AtomicBool,
 }
 
@@ -717,6 +724,7 @@ struct Operation {
 fn spawn_operation<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
 ) -> mpsc::Receiver<Value>
 where
     S: tower::Service<
@@ -727,12 +735,13 @@ where
     S::Error: Into<nanocodex_oai_api::ResponseError> + Send,
     S::Future: Send,
 {
-    spawn_operation_with_handle(state, items).receiver
+    spawn_operation_with_handle(state, items, previous_response_id).receiver
 }
 
 fn spawn_operation_with_handle<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
 ) -> Operation
 where
     S: tower::Service<
@@ -746,7 +755,9 @@ where
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let task = tokio::spawn(async move {
         let failed_state = Arc::clone(&state);
-        if let Err(error) = drive_operation(state, items, sender.clone()).await {
+        if let Err(error) =
+            drive_operation(state, items, previous_response_id, sender.clone()).await
+        {
             failed_state.failed.store(true, Ordering::Release);
             let _ = sender.send(upstream_error_value(error)).await;
         }
@@ -757,6 +768,7 @@ where
 async fn drive_operation<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
     sender: mpsc::Sender<Value>,
 ) -> Result<(), &'static str>
 where
@@ -769,9 +781,15 @@ where
     S::Future: Send,
 {
     let request_items = items;
-    let previous_input = state.last_input.lock().await.clone();
-    let previous_output = state.last_output.lock().await.clone();
-    let items = input_delta(request_items.clone(), &previous_input, &previous_output);
+    let can_delta = previous_response_id.is_some()
+        && previous_response_id == *state.last_response_id.lock().await;
+    let items = if can_delta {
+        let previous_input = state.last_input.lock().await.clone();
+        let previous_output = state.last_output.lock().await.clone();
+        input_delta(request_items.clone(), &previous_input, &previous_output)
+    } else {
+        request_items.clone()
+    };
     let mut session = state.session.lock().await;
     let mut turn = session.turn();
     let mut response = turn.create(ResponseInput::items(items));
@@ -799,6 +817,7 @@ where
     }
     *state.last_output.lock().await = completed.output().to_vec();
     *state.last_input.lock().await = request_items;
+    *state.last_response_id.lock().await = Some(response_id.clone());
     let terminal = json!({
         "type": "response.completed",
         "response": {
@@ -859,6 +878,23 @@ fn response_items_match(left: &ResponseItem, right: &ResponseItem) -> bool {
     }
 }
 
+fn reasoning_output_index(output: &[ResponseItem], item_id: Option<&str>) -> usize {
+    item_id
+        .and_then(|item_id| {
+            output
+                .iter()
+                .position(|item| item.id().is_some_and(|id| id.as_str() == item_id))
+        })
+        .unwrap_or_else(|| output.len().saturating_sub(1))
+}
+
+fn reasoning_item_id(output: &[ResponseItem], output_index: usize) -> Option<String> {
+    output
+        .get(output_index)
+        .and_then(ResponseItem::id)
+        .map(|id| id.as_str().to_owned())
+}
+
 fn native_event(
     event: ResponseEvent,
     response_id: &str,
@@ -901,29 +937,43 @@ fn native_event(
         ResponseEvent::ReasoningSummaryDelta {
             delta,
             summary_index,
-        } => Some(json!({
-            "type": "response.reasoning_summary_text.delta",
-            "summary_index": summary_index,
-            "delta": delta
-        })),
+        } => {
+            let output_index = output.len().saturating_sub(1);
+            Some(json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_item_id(output, output_index),
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta
+            }))
+        }
         ResponseEvent::ReasoningSummaryDone {
             item_id,
             text,
             summary_index,
-        } => Some(json!({
-            "type": "response.reasoning_summary_text.done",
-            "item_id": item_id,
-            "summary_index": summary_index,
-            "text": text
-        })),
+        } => {
+            let output_index = reasoning_output_index(output, Some(item_id.as_str()));
+            Some(json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "text": text
+            }))
+        }
         ResponseEvent::ReasoningContentDelta {
             delta,
             content_index,
-        } => Some(json!({
-            "type": "response.reasoning_text.delta",
-            "content_index": content_index,
-            "delta": delta
-        })),
+        } => {
+            let output_index = output.len().saturating_sub(1);
+            Some(json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": reasoning_item_id(output, output_index),
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": delta
+            }))
+        }
         ResponseEvent::ReasoningSummaryPartAdded { summary_index } => Some(json!({
             "type": "response.reasoning_summary_part.added",
             "summary_index": summary_index
@@ -1009,9 +1059,17 @@ where
                     .and_then(WireRequest::lower);
                 match parsed {
                     Ok(request) => {
-                        let state = match &session {
-                            Some(state) => Arc::clone(state),
-                            None => match bridge.new_session(
+                        let reuse = if let Some(state) = &session {
+                            request.previous_response_id.is_some()
+                                && request.previous_response_id.as_deref()
+                                    == state.last_response_id.lock().await.as_deref()
+                        } else {
+                            false
+                        };
+                        let state = if reuse {
+                            Arc::clone(session.as_ref().expect("reused session"))
+                        } else {
+                            match bridge.new_session(
                                 request.instructions.as_deref(),
                                 request.tools,
                                 request.prompt_cache_key.as_deref(),
@@ -1021,6 +1079,7 @@ where
                                         session: Mutex::new(new_session),
                                         last_input: Mutex::new(Vec::new()),
                                         last_output: Mutex::new(Vec::new()),
+                                        last_response_id: Mutex::new(None),
                                         failed: AtomicBool::new(false),
                                     });
                                     session = Some(Arc::clone(&state));
@@ -1036,9 +1095,13 @@ where
                                         .await;
                                     continue;
                                 }
-                            },
+                            }
                         };
-                        active = Some(spawn_operation_with_handle(state, request.items));
+                        active = Some(spawn_operation_with_handle(
+                            state,
+                            request.items,
+                            request.previous_response_id,
+                        ));
                     }
                     Err(error) => {
                         if socket
@@ -1146,5 +1209,51 @@ mod tests {
         assert!(
             matches!(&request.items[0], ResponseItem::Message { content, .. } if matches!(&content[0], ContentItem::InputImage { image_url, .. } if image_url.starts_with("data:image/png")))
         );
+    }
+
+    #[test]
+    fn reasoning_events_include_output_indices() {
+        let reasoning: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_test",
+            "summary": []
+        }))
+        .unwrap();
+        let mut output = vec![reasoning];
+        let delta = native_event(
+            ResponseEvent::ReasoningSummaryDelta {
+                delta: "thinking".to_owned(),
+                summary_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(delta["output_index"], 0);
+        assert_eq!(delta["item_id"], "rs_test");
+
+        let done = native_event(
+            ResponseEvent::ReasoningSummaryDone {
+                item_id: "rs_test".to_owned(),
+                text: "thinking".to_owned(),
+                summary_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(done["output_index"], 0);
+
+        let content_delta = native_event(
+            ResponseEvent::ReasoningContentDelta {
+                delta: "more".to_owned(),
+                content_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(content_delta["output_index"], 0);
+        assert_eq!(content_delta["item_id"], "rs_test");
     }
 }

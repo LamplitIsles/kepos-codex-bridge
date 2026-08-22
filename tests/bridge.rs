@@ -143,6 +143,7 @@ async fn start_bridge_mode(
         output_image_seen,
         None,
         None,
+        None,
     )
     .await
 }
@@ -159,6 +160,7 @@ async fn start_bridge_mode_with_image(
     output_image_seen: Option<Arc<AtomicBool>>,
     image_auth: Option<OpenAiAuth>,
     image_api_base_url: Option<String>,
+    request_inputs: Option<Arc<Mutex<Vec<Vec<ResponseItem>>>>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let image_auth = image_auth.unwrap_or_else(|| OpenAiAuth::api_key("dummy-client-key"));
     let openai = OpenAi::builder(image_auth.clone())
@@ -169,15 +171,20 @@ async fn start_bridge_mode_with_image(
             let image_seen = image_seen.clone();
             let output_seen = output_seen.clone();
             let output_image_seen = output_image_seen.clone();
+            let request_inputs = request_inputs.clone();
             service_fn(move |attempt: nanocodex_oai_api::tower::ResponsesAttempt| {
                 let calls = Arc::clone(&calls);
                 let cancelled = Arc::clone(&cancelled);
                 let image_seen = image_seen.clone();
                 let output_seen = output_seen.clone();
                 let output_image_seen = output_image_seen.clone();
+                let request_inputs = request_inputs.clone();
                 async move {
                     let call_number = calls.fetch_add(1, Ordering::SeqCst);
-                    let inputs = attempt.input_items().collect::<Vec<_>>();
+                    let inputs = attempt.input_items().cloned().collect::<Vec<_>>();
+                    if let Some(request_inputs) = request_inputs {
+                        request_inputs.lock().await.push(inputs.clone());
+                    }
                     let encoded_inputs = serde_json::to_string(&inputs).expect("test input JSON");
                     if encoded_inputs.contains("data:image/png") {
                         if let Some(seen) = image_seen.as_ref() {
@@ -330,6 +337,7 @@ async fn image_generation_uses_fixed_contract_and_managed_header_shape() {
         None,
         Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
         Some(upstream),
+        None,
     )
     .await;
     let response = Client::new()
@@ -388,6 +396,7 @@ async fn image_edit_accepts_five_data_images_and_rejects_invalid_inputs() {
         None,
         None,
         Some(upstream),
+        None,
     )
     .await;
     let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
@@ -455,6 +464,7 @@ async fn image_errors_are_generic_and_do_not_echo_request_data() {
         None,
         None,
         Some(upstream),
+        None,
     )
     .await;
     let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
@@ -551,6 +561,84 @@ async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
     );
     assert!(event_types.iter().any(|kind| kind == "response.completed"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_context_fallback_rebuilds_websocket_session() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let request_inputs = Arc::new(Mutex::new(Vec::new()));
+    let (url, server) = start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(request_inputs.clone()),
+    )
+    .await;
+    let (mut socket, _) = connect_async(url.replacen("http", "ws", 1))
+        .await
+        .expect("WebSocket connection");
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.6-luna",
+                "input": "first turn"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("first request");
+    while let Some(Ok(Message::Text(text))) = socket.next().await {
+        if text.contains("response.completed") {
+            break;
+        }
+    }
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.6-luna",
+                "instructions": "new session instructions",
+                "input": [
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"first turn"}]},
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"bridge text"}]},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"second turn"}]}
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("full-context fallback request");
+    while let Some(Ok(Message::Text(text))) = socket.next().await {
+        if text.contains("response.completed") {
+            break;
+        }
+    }
+    let inputs = request_inputs.lock().await;
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0].len(), 3);
+    assert_eq!(inputs[1].len(), 5);
+    assert!(
+        serde_json::to_string(&inputs[1])
+            .unwrap()
+            .contains("new session instructions")
+    );
+    assert!(
+        serde_json::to_string(&inputs[1])
+            .unwrap()
+            .contains("second turn")
+    );
     server.abort();
 }
 
@@ -745,8 +833,11 @@ async fn image_and_function_output_continuation_remain_typed() {
         ))
         .await
         .expect("first request");
+    let mut first_response_id = None;
     while let Some(Ok(Message::Text(text))) = socket.next().await {
-        if text.contains("response.completed") {
+        let value: Value = serde_json::from_str(&text).expect("first native event JSON");
+        if value["type"] == "response.completed" {
+            first_response_id = value["response"]["id"].as_str().map(str::to_owned);
             break;
         }
     }
@@ -755,6 +846,7 @@ async fn image_and_function_output_continuation_remain_typed() {
             json!({
                 "type": "response.create",
                 "model": "gpt-5.6-luna",
+                "previous_response_id": first_response_id.expect("first response ID"),
                 "input": [
                     {"type":"message","role":"user","content":[
                         {"type":"input_text","text":"Find Paris weather"},

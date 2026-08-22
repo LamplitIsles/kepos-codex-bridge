@@ -165,16 +165,19 @@ continuation, the image generation/edit contract and boundaries, generic image
 failures, and cancellation/disconnect propagation. Upstream Nanocodex transport
 and Kepos ACL matrices are intentionally not duplicated.
 
-The two non-hermetic acceptance probes are operator/deployment checks, not CI
-or agent tests. Run one combined Pi probe and one combined DSH probe only after
-installing the corresponding client and configuring a test-owned client
-profile. Each probe must cover WebSocket text, a Luna image, one function-call
-round, and cancellation; a missing client or test profile is a failure, not a
-skip. Operator publication verification must use the same named, allowlisted
-Kepos HTTP service for `/codex/images` and a test-owned rejected request to
-confirm that no intermediary imposes a lower-than-32-MiB bound; it must not
-trigger image generation or mutate OAuth state. The minimal live OAuth request
-is an explicitly approved deployment validation and must use a dedicated bridge
+The non-hermetic Pi acceptance probe is an operator/deployment check, not a CI
+or agent test. Run one combined Pi probe after installing Pi and configuring a
+test-owned client profile. It must cover WebSocket text, a Luna image, one
+function-call round, and cancellation; a missing Pi or test profile is a
+failure, not a skip. DSH remains a documented native consumer of the shared
+endpoint, but this repository does not install, configure, or exercise DSH and
+does not carry a DSH-specific adapter, fixture, or heavy integration harness.
+Validate a later DSH integration separately against an already-running DSH.
+Operator publication verification must use the same named, allowlisted Kepos
+HTTP service for `/codex/images` and a test-owned rejected request to confirm
+that no intermediary imposes a lower-than-32-MiB bound; it must not trigger
+image generation or mutate OAuth state. The minimal live OAuth request is an
+explicitly approved deployment validation and must use a dedicated bridge
 credential file; it is never run by CI or this repository's automated tests.
 
 ## Scope and security boundary
