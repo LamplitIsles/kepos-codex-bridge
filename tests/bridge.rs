@@ -893,7 +893,7 @@ async fn image_and_function_output_continuation_remain_typed() {
                     {"type":"input_text","text":"Find Paris weather"},
                     {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
                 ]}],
-                "tools": [{"type":"function","name":"lookup","description":"look up weather","parameters":{"type":"object"}}]
+                "tools": [{"type":"function","name":"lookup","description":"look up weather","strict":null,"parameters":{"type":"object"}}]
             })
             .to_string()
             .into(),

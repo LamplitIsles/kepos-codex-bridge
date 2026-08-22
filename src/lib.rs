@@ -230,7 +230,7 @@ struct WireTool {
     #[serde(default)]
     description: String,
     #[serde(default)]
-    strict: bool,
+    strict: Option<bool>,
     parameters: Value,
 }
 
@@ -414,7 +414,7 @@ impl WireTool {
         Ok(ToolDefinition::Function {
             name: self.name.into_boxed_str(),
             description: self.description.into_boxed_str(),
-            strict: self.strict,
+            strict: self.strict.unwrap_or(false),
             defer_loading: None,
             parameters: JsonSchema::from(self.parameters),
             output_schema: None,
