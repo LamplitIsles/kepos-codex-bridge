@@ -14,7 +14,9 @@ The bridge publishes two sibling routes through the same HTTP service:
   `data: {native JSON}\n\n` followed by `data: [DONE]\n\n`. WebSocket upgrade on
   the same route accepts text `response.create` frames and returns native
   response event frames. `response.cancel` cancels the active operation. This
-  route retains its existing 4 MiB request limit.
+  route also supports the selected Compact V2 extension's opaque compaction
+  checkpoint and final trigger items, and retains its existing 4 MiB request
+  limit.
 - `POST /codex/images` accepts JSON `{ "prompt": string, "images"?: string[] }`.
   A nonblank prompt with no images performs generation; one through five
   `data:image/...` inputs performs editing. The route returns exactly

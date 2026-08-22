@@ -61,6 +61,7 @@ pub struct Bridge<F> {
     image_auth: OpenAiAuth,
     image_client: reqwest::Client,
     image_api_base_url: Arc<str>,
+    responses_api_base_url: Arc<str>,
     model: Model,
     instructions: Arc<str>,
 }
@@ -92,6 +93,7 @@ where
         Ok(Self {
             openai,
             image_api_base_url: Arc::from(image_auth.mode().default_api_base_url()),
+            responses_api_base_url: Arc::from(image_auth.mode().default_api_base_url()),
             image_auth,
             image_client: reqwest::Client::new(),
             model,
@@ -104,6 +106,14 @@ where
     #[must_use]
     pub fn with_image_api_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
         self.image_api_base_url = base_url.into();
+        self
+    }
+
+    /// Overrides the upstream Responses API base URL for an isolated deployment
+    /// or test-owned local listener. The public bridge contract remains fixed.
+    #[must_use]
+    pub fn with_responses_api_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
+        self.responses_api_base_url = base_url.into();
         self
     }
 
@@ -333,6 +343,22 @@ impl WireRequest {
         if items.is_empty() {
             return Err(BridgeError::InvalidRequest("input must not be empty"));
         }
+        let trigger_count = items
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::CompactionTrigger {}))
+            .count();
+        if trigger_count > 0 {
+            if trigger_count != 1 {
+                return Err(BridgeError::InvalidRequest(
+                    "input must contain exactly one compaction trigger",
+                ));
+            }
+            if !matches!(items.last(), Some(ResponseItem::CompactionTrigger {})) {
+                return Err(BridgeError::InvalidRequest(
+                    "compaction trigger must be the final input item",
+                ));
+            }
+        }
         for item in &items {
             if !is_supported_input_item(item) {
                 return Err(BridgeError::InvalidRequest(
@@ -390,6 +416,10 @@ fn is_supported_input_item(item: &ResponseItem) -> bool {
             .iter()
             .all(|content| matches!(content, ContentItem::OutputText { .. })),
         ResponseItem::Reasoning { .. } | ResponseItem::FunctionCall { .. } => true,
+        ResponseItem::Compaction {
+            encrypted_content, ..
+        } => !encrypted_content.is_empty(),
+        ResponseItem::CompactionTrigger {} => true,
         ResponseItem::FunctionCallOutput { output, .. } => match output {
             FunctionOutputBody::Text(_) => true,
             FunctionOutputBody::Content(content) => content.iter().all(|content| {
@@ -610,13 +640,70 @@ where
         }
         request.json(body).send().await.map_err(|_| ())
     }
+
+    async fn forward_compaction(&self, body: Bytes) -> Result<reqwest::Response, ()> {
+        let auth = self.image_auth.snapshot().await.map_err(|_| ())?;
+        let endpoint = format!(
+            "{}/responses",
+            self.responses_api_base_url.trim_end_matches('/')
+        );
+        let response = self
+            .send_compaction_request(&endpoint, &body, &auth)
+            .await?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && auth.mode() == OpenAiAuthMode::ChatGpt
+        {
+            self.image_auth
+                .recover_unauthorized(&auth)
+                .await
+                .map_err(|_| ())?;
+            let refreshed = self.image_auth.snapshot().await.map_err(|_| ())?;
+            self.send_compaction_request(&endpoint, &body, &refreshed)
+                .await?
+        } else {
+            response
+        };
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(())
+        }
+    }
+
+    async fn send_compaction_request(
+        &self,
+        endpoint: &str,
+        body: &Bytes,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, ()> {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut request = self
+            .image_client
+            .post(endpoint)
+            .header(USER_AGENT, NANOCODEX_USER_AGENT)
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "text/event-stream")
+            .header("x-codex-beta-features", "remote_compaction_v2")
+            .header("session-id", &session_id)
+            .header("thread-id", &session_id)
+            .header("x-client-request-id", &session_id)
+            .body(body.clone());
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request.send().await.map_err(|_| ())
+    }
 }
 
 async fn http_responses<F>(
     State(bridge): State<Arc<Bridge<F>>>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse
+) -> Response
 where
     F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
     F::Service: Service<
@@ -628,11 +715,25 @@ where
         Into<nanocodex_oai_api::ResponseError> + Send,
     <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
 {
-    let parsed = decode_response_body(&headers, body)
-        .and_then(|body| WireRequest::parse(&body, false, bridge.model))
-        .and_then(WireRequest::lower);
-    let (status, receiver) = match parsed {
-        Ok(request) => match bridge.new_session(
+    let parsed = decode_response_body(&headers, body).and_then(|body| {
+        let request = WireRequest::parse(&body, false, bridge.model)?;
+        let request = request.lower()?;
+        Ok((body, request))
+    });
+    match parsed {
+        Ok((body, request)) if has_compaction_trigger(&request.items) => {
+            match strip_peer_api_key(&body) {
+                Ok(body) => match bridge.forward_compaction(body).await {
+                    Ok(response) => direct_sse_response(response),
+                    Err(()) => sse_response(
+                        StatusCode::BAD_GATEWAY,
+                        upstream_error_receiver("upstream compaction failed"),
+                    ),
+                },
+                Err(error) => sse_response(StatusCode::BAD_REQUEST, error_receiver(error)),
+            }
+        }
+        Ok((_, request)) => match bridge.new_session(
             request.instructions.as_deref(),
             request.tools,
             request.prompt_cache_key.as_deref(),
@@ -645,16 +746,15 @@ where
                     last_response_id: Mutex::new(None),
                     failed: AtomicBool::new(false),
                 });
-                (
+                sse_response(
                     StatusCode::OK,
                     spawn_operation(state, request.items, request.previous_response_id),
                 )
             }
-            Err(error) => (StatusCode::BAD_REQUEST, error_receiver(error)),
+            Err(error) => sse_response(StatusCode::BAD_REQUEST, error_receiver(error)),
         },
-        Err(error) => (StatusCode::BAD_REQUEST, error_receiver(error)),
-    };
-    sse_response(status, receiver)
+        Err(error) => sse_response(StatusCode::BAD_REQUEST, error_receiver(error)),
+    }
 }
 
 async fn websocket_responses<F>(
@@ -700,6 +800,35 @@ fn decode_response_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Bridg
     }
 }
 
+fn has_compaction_trigger(items: &[ResponseItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, ResponseItem::CompactionTrigger {}))
+}
+
+fn strip_peer_api_key(body: &[u8]) -> Result<Bytes, BridgeError> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|_| BridgeError::InvalidRequest("malformed or unsupported request"))?;
+    value
+        .as_object_mut()
+        .ok_or(BridgeError::InvalidRequest(
+            "malformed or unsupported request",
+        ))?
+        .remove("api_key");
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|_| BridgeError::InvalidRequest("malformed or unsupported request"))
+}
+
+fn direct_sse_response(upstream: reqwest::Response) -> Response {
+    HttpResponse::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
+}
+
 fn sse_response(status: StatusCode, receiver: mpsc::Receiver<Value>) -> HttpResponse<Body> {
     let stream = ReceiverStream::new(receiver).map(|value| {
         let data = serde_json::to_string(&value).unwrap_or_else(|_| {
@@ -719,9 +848,17 @@ fn sse_response(status: StatusCode, receiver: mpsc::Receiver<Value>) -> HttpResp
 }
 
 fn error_receiver(error: BridgeError) -> mpsc::Receiver<Value> {
-    let (sender, receiver) = mpsc::channel(1);
     let BridgeError::InvalidRequest(message) = error;
-    let _ = sender.try_send(error_value(message));
+    value_receiver(error_value(message))
+}
+
+fn upstream_error_receiver(message: &'static str) -> mpsc::Receiver<Value> {
+    value_receiver(upstream_error_value(message))
+}
+
+fn value_receiver(value: Value) -> mpsc::Receiver<Value> {
+    let (sender, receiver) = mpsc::channel(1);
+    let _ = sender.try_send(value);
     receiver
 }
 
@@ -1091,6 +1228,20 @@ where
                     .and_then(WireRequest::lower);
                 match parsed {
                     Ok(request) => {
+                        if has_compaction_trigger(&request.items) {
+                            if socket
+                                .send(Message::Text(
+                                    error_value("compaction triggers require HTTP/SSE")
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
                         let reuse = if let Some(state) = &session {
                             request.previous_response_id.is_some()
                                 && request.previous_response_id.as_deref()
@@ -1229,6 +1380,43 @@ mod tests {
             "invalid request: store: true is unsupported"
         );
         assert!(!error.to_string().contains("hello"));
+    }
+
+    #[test]
+    fn compaction_input_requires_one_final_trigger_and_nonempty_checkpoint() {
+        let valid = br#"{"model":"gpt-5.6-luna","input":[{"type":"compaction","encrypted_content":"opaque"},{"type":"compaction_trigger"}]}"#;
+        let request = WireRequest::parse(valid, false, Model::Luna)
+            .unwrap()
+            .lower()
+            .unwrap();
+        assert!(matches!(request.items[0], ResponseItem::Compaction { .. }));
+        assert!(matches!(
+            request.items[1],
+            ResponseItem::CompactionTrigger {}
+        ));
+
+        for input in [
+            json!([
+                {"type":"compaction_trigger"},
+                {"type":"compaction","encrypted_content":"opaque"}
+            ]),
+            json!([
+                {"type":"compaction_trigger"},
+                {"type":"compaction_trigger"}
+            ]),
+            json!([
+                {"type":"compaction","encrypted_content":""},
+                {"type":"compaction_trigger"}
+            ]),
+        ] {
+            let raw = json!({"model":"gpt-5.6-luna","input":input}).to_string();
+            let error = WireRequest::parse(raw.as_bytes(), false, Model::Luna)
+                .unwrap()
+                .lower()
+                .err()
+                .unwrap();
+            assert!(error.to_string().starts_with("invalid request:"));
+        }
     }
 
     #[test]

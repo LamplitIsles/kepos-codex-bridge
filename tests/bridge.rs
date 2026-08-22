@@ -113,6 +113,59 @@ async fn start_image_upstream(
     (format!("http://{address}"), calls, task)
 }
 
+#[derive(Clone)]
+struct CompactUpstreamState {
+    request: Arc<Mutex<Option<(HeaderMap, Value)>>>,
+    response: &'static str,
+}
+
+async fn compact_upstream(
+    State(state): State<CompactUpstreamState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let value = serde_json::from_slice(&body).expect("compaction upstream JSON");
+    *state.request.lock().await = Some((headers, value));
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(state.response))
+        .expect("compaction SSE response")
+}
+
+async fn start_compact_upstream() -> (
+    String,
+    Arc<Mutex<Option<(HeaderMap, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let request = Arc::new(Mutex::new(None));
+    let state = CompactUpstreamState {
+        request: request.clone(),
+        response: r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}}
+
+data: {"type":"response.completed","response":{"id":"resp-upstream","object":"response","status":"completed","output":[{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}],"usage":null,"end_turn":true}}
+
+data: [DONE]
+
+"#,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("compaction upstream listener");
+    let address = listener.local_addr().expect("compaction upstream address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/responses", axum::routing::post(compact_upstream))
+                .with_state(state),
+        )
+        .await
+        .expect("compaction upstream server");
+    });
+    (format!("http://{address}"), request, task)
+}
+
 async fn start_bridge(
     calls: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
@@ -144,6 +197,7 @@ async fn start_bridge_mode(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -160,6 +214,7 @@ async fn start_bridge_mode_with_image(
     output_image_seen: Option<Arc<AtomicBool>>,
     image_auth: Option<OpenAiAuth>,
     image_api_base_url: Option<String>,
+    responses_api_base_url: Option<String>,
     request_inputs: Option<Arc<Mutex<Vec<Vec<ResponseItem>>>>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let image_auth = image_auth.unwrap_or_else(|| OpenAiAuth::api_key("dummy-client-key"));
@@ -212,7 +267,17 @@ async fn start_bridge_mode_with_image(
                         let _guard = CancelGuard(cancelled);
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
-                    let items = if multi_output {
+                    let items = if encoded_inputs.contains("\"type\":\"compaction\"") {
+                        vec![(
+                            serde_json::from_value(json!({
+                                "type": "compaction",
+                                "id": "cmp-test",
+                                "encrypted_content": "opaque-output"
+                            }))
+                            .expect("compaction output item"),
+                            "",
+                        )]
+                    } else if multi_output {
                         vec![
                             (
                                 ResponseItem::message(
@@ -257,9 +322,11 @@ async fn start_bridge_mode_with_image(
                         attempt
                             .emit(ResponseEvent::OutputItemAdded(item.clone()))
                             .await;
-                        attempt
-                            .emit(ResponseEvent::OutputTextDelta((*delta).to_owned()))
-                            .await;
+                        if !delta.is_empty() {
+                            attempt
+                                .emit(ResponseEvent::OutputTextDelta((*delta).to_owned()))
+                                .await;
+                        }
                         attempt
                             .emit(ResponseEvent::OutputItemDone(item.clone()))
                             .await;
@@ -287,6 +354,11 @@ async fn start_bridge_mode_with_image(
         Bridge::new(openai, image_auth, Model::Luna, "test instruction").expect("bridge config");
     let bridge = if let Some(base_url) = image_api_base_url {
         bridge.with_image_api_base_url(base_url)
+    } else {
+        bridge
+    };
+    let bridge = if let Some(base_url) = responses_api_base_url {
+        bridge.with_responses_api_base_url(base_url)
     } else {
         bridge
     };
@@ -337,6 +409,7 @@ async fn image_generation_uses_fixed_contract_and_managed_header_shape() {
         None,
         Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
         Some(upstream),
+        None,
         None,
     )
     .await;
@@ -396,6 +469,7 @@ async fn image_edit_accepts_five_data_images_and_rejects_invalid_inputs() {
         None,
         None,
         Some(upstream),
+        None,
         None,
     )
     .await;
@@ -464,6 +538,7 @@ async fn image_errors_are_generic_and_do_not_echo_request_data() {
         None,
         None,
         Some(upstream),
+        None,
         None,
     )
     .await;
@@ -560,6 +635,25 @@ async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
             .any(|kind| kind == "response.output_text.delta")
     );
     assert!(event_types.iter().any(|kind| kind == "response.completed"));
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.6-luna",
+                "input": [
+                    {"type":"compaction","encrypted_content":"opaque-checkpoint"},
+                    {"type":"compaction_trigger"}
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("WebSocket compaction request");
+    let Some(Ok(Message::Text(text))) = socket.next().await else {
+        panic!("WebSocket compaction rejection");
+    };
+    assert!(text.contains("compaction triggers require HTTP/SSE"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
@@ -575,6 +669,7 @@ async fn full_context_fallback_rebuilds_websocket_session() {
         false,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -640,6 +735,131 @@ async fn full_context_fallback_rebuilds_websocket_session() {
             .contains("second turn")
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn remote_compaction_forwards_native_sse_and_managed_headers() {
+    let (upstream, upstream_request, upstream_server) = start_compact_upstream().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (url, server) = start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
+        None,
+        Some(upstream),
+        None,
+    )
+    .await;
+    let request_body = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type":"compaction","encrypted_content":"opaque-checkpoint"},
+            {"type":"compaction_trigger"}
+        ],
+        "api_key": "peer-compatibility-key",
+        "stream": true
+    });
+    let response = Client::new()
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .expect("compaction response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("compaction SSE body");
+    let expected = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}}
+
+data: {"type":"response.completed","response":{"id":"resp-upstream","object":"response","status":"completed","output":[{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}],"usage":null,"end_turn":true}}
+
+data: [DONE]
+
+"#;
+    assert_eq!(body, expected);
+    let (headers, value) = upstream_request
+        .lock()
+        .await
+        .take()
+        .expect("compaction upstream request");
+    assert_eq!(
+        value["input"].as_array().unwrap().last().unwrap()["type"],
+        "compaction_trigger"
+    );
+    assert_eq!(value["input"][0]["encrypted_content"], "opaque-checkpoint");
+    assert!(value.get("api_key").is_none());
+    assert_eq!(headers["authorization"], "Bearer managed-bearer");
+    assert_eq!(headers["chatgpt-account-id"], "managed-account");
+    assert_eq!(headers["x-openai-fedramp"], "true");
+    assert_eq!(headers["user-agent"], "nanocodex/0.5.0");
+    assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+    assert_eq!(headers["session-id"], headers["thread-id"]);
+    assert_eq!(headers["session-id"], headers["x-client-request-id"]);
+    assert_eq!(headers["x-codex-beta-features"], "remote_compaction_v2");
+    server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn malformed_remote_compaction_inputs_are_rejected_before_upstream() {
+    let (upstream, upstream_request, upstream_server) = start_compact_upstream().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (url, server) = start_bridge_mode_with_image(
+        calls.clone(),
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
+        None,
+        Some(upstream),
+        None,
+    )
+    .await;
+    let client = Client::new();
+    for input in [
+        json!([
+            {"type":"compaction_trigger"},
+            {"type":"compaction","encrypted_content":"opaque"}
+        ]),
+        json!([
+            {"type":"compaction","encrypted_content":"opaque"},
+            {"type":"compaction_trigger"},
+            {"type":"compaction_trigger"}
+        ]),
+        json!([
+            {"type":"compaction","encrypted_content":""},
+            {"type":"compaction_trigger"}
+        ]),
+    ] {
+        let response = client
+            .post(&url)
+            .json(&json!({"model":"gpt-5.6-luna","input":input}))
+            .send()
+            .await
+            .expect("invalid compaction response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("invalid compaction body")
+                .contains("invalid_request_error")
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(upstream_request.lock().await.is_none());
+    server.abort();
+    upstream_server.abort();
 }
 
 #[tokio::test]
@@ -796,7 +1016,10 @@ async fn invalid_input_and_downstream_cancellation_stop_upstream() {
         .post(&url)
         .json(&json!({
             "model": "gpt-5.6-luna",
-            "input": [{"type": "compaction_trigger"}]
+            "input": [
+                {"type": "compaction_trigger"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "late"}]}
+            ]
         }))
         .send()
         .await
@@ -807,7 +1030,7 @@ async fn invalid_input_and_downstream_cancellation_stop_upstream() {
             .text()
             .await
             .expect("rich-input error body")
-            .contains("input item is outside the supported subset")
+            .contains("compaction trigger must be the final input item")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 

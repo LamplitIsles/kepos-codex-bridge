@@ -10,7 +10,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "json
 clap = { version = "4.5.54", features = ["derive", "env"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 nanocodex-oai-api = { git = "https://github.com/gakonst/nanocodex", rev = "7068272602508100b166715b4dfa68c3c36cdf22", version = "0.5.0" }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.17"
