@@ -6,27 +6,122 @@ use std::{
     time::Duration,
 };
 
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use futures_util::{SinkExt, StreamExt};
-use kepos_codex_bridge::{Bridge, ENDPOINT};
+use kepos_codex_bridge::{Bridge, ENDPOINT, IMAGE_ENDPOINT};
 use nanocodex_oai_api::{
     Model, OpenAi, ResponseError, ResponseEvent,
+    auth::{
+        OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
+        OpenAiAuthSource,
+    },
     responses::{ContentItem, MessageRole, ResponseItem},
     tower::{GenerationOutput, ResponsePipelineStats, ResponsesOutput, ResponsesServiceResponse},
 };
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tower::service_fn;
+
+struct TestManagedAuth;
+
+impl OpenAiAuthSource for TestManagedAuth {
+    fn validate(&self) -> Result<(), OpenAiAuthError> {
+        Ok(())
+    }
+
+    fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
+        Box::pin(async {
+            Ok(OpenAiAuthSnapshot::new(
+                OpenAiAuthMode::ChatGpt,
+                "managed-bearer",
+                Some("managed-account"),
+                true,
+                0,
+            ))
+        })
+    }
+
+    fn recover_unauthorized(
+        &self,
+        _rejected: &OpenAiAuthSnapshot,
+    ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
+        Box::pin(async { Err(OpenAiAuthError::LoginRequired("test auth".into())) })
+    }
+}
+
+#[derive(Clone)]
+struct ImageUpstreamState {
+    calls: Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
+    fail: bool,
+}
+
+async fn image_upstream(
+    State(state): State<ImageUpstreamState>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let value = serde_json::from_slice(&body).expect("image upstream JSON");
+    state
+        .calls
+        .lock()
+        .await
+        .push((uri.path().to_owned(), headers, value));
+    if state.fail {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    axum::Json(json!({
+        "created": 1,
+        "data": [{"b64_json": "AAAA"}]
+    }))
+    .into_response()
+}
+
+async fn start_image_upstream(
+    fail: bool,
+) -> (
+    String,
+    Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = ImageUpstreamState {
+        calls: calls.clone(),
+        fail,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("image upstream listener");
+    let address = listener.local_addr().expect("image upstream address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/images/generations", axum::routing::post(image_upstream))
+                .route("/images/edits", axum::routing::post(image_upstream))
+                .with_state(state),
+        )
+        .await
+        .expect("image upstream server");
+    });
+    (format!("http://{address}"), calls, task)
+}
 
 async fn start_bridge(
     calls: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
     wait: bool,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    start_bridge_mode(calls, cancelled, wait, false, false, None, None).await
+    start_bridge_mode(calls, cancelled, wait, false, false, None, None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_bridge_mode(
     calls: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
@@ -35,19 +130,51 @@ async fn start_bridge_mode(
     multi_output: bool,
     image_seen: Option<Arc<AtomicBool>>,
     output_seen: Option<Arc<AtomicBool>>,
+    output_image_seen: Option<Arc<AtomicBool>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let openai = OpenAi::builder("dummy-client-key")
+    start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        wait,
+        function_round,
+        multi_output,
+        image_seen,
+        output_seen,
+        output_image_seen,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_bridge_mode_with_image(
+    calls: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicBool>,
+    wait: bool,
+    function_round: bool,
+    multi_output: bool,
+    image_seen: Option<Arc<AtomicBool>>,
+    output_seen: Option<Arc<AtomicBool>>,
+    output_image_seen: Option<Arc<AtomicBool>>,
+    image_auth: Option<OpenAiAuth>,
+    image_api_base_url: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let image_auth = image_auth.unwrap_or_else(|| OpenAiAuth::api_key("dummy-client-key"));
+    let openai = OpenAi::builder(image_auth.clone())
         .model(Model::Luna)
         .service(move || {
             let calls = Arc::clone(&calls);
             let cancelled = Arc::clone(&cancelled);
             let image_seen = image_seen.clone();
             let output_seen = output_seen.clone();
+            let output_image_seen = output_image_seen.clone();
             service_fn(move |attempt: nanocodex_oai_api::tower::ResponsesAttempt| {
                 let calls = Arc::clone(&calls);
                 let cancelled = Arc::clone(&cancelled);
                 let image_seen = image_seen.clone();
                 let output_seen = output_seen.clone();
+                let output_image_seen = output_image_seen.clone();
                 async move {
                     let call_number = calls.fetch_add(1, Ordering::SeqCst);
                     let inputs = attempt.input_items().collect::<Vec<_>>();
@@ -59,6 +186,11 @@ async fn start_bridge_mode(
                     }
                     if encoded_inputs.contains("function_call_output") {
                         if let Some(seen) = output_seen.as_ref() {
+                            seen.store(true, Ordering::SeqCst);
+                        }
+                        if encoded_inputs.contains("data:image/png")
+                            && let Some(seen) = output_image_seen.as_ref()
+                        {
                             seen.store(true, Ordering::SeqCst);
                         }
                     }
@@ -144,7 +276,13 @@ async fn start_bridge_mode(
         })
         .build()
         .expect("test client configuration");
-    let bridge = Bridge::new(openai, Model::Luna, "test instruction").expect("bridge config");
+    let bridge =
+        Bridge::new(openai, image_auth, Model::Luna, "test instruction").expect("bridge config");
+    let bridge = if let Some(base_url) = image_api_base_url {
+        bridge.with_image_api_base_url(base_url)
+    } else {
+        bridge
+    };
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("test listener");
@@ -174,6 +312,182 @@ async fn wait_until_cancelled(cancelled: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn image_generation_uses_fixed_contract_and_managed_header_shape() {
+    let (upstream, image_calls, upstream_server) = start_image_upstream(false).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (responses_url, bridge_server) = start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
+        Some(upstream),
+    )
+    .await;
+    let response = Client::new()
+        .post(responses_url.replace(ENDPOINT, IMAGE_ENDPOINT))
+        .header("content-type", "application/json")
+        .json(&json!({
+            "prompt": "draw a secret sentinel",
+            "api_key": "peer-compatibility-key"
+        }))
+        .send()
+        .await
+        .expect("image response");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.expect("image JSON"),
+        json!({"image_url": "data:image/png;base64,AAAA"})
+    );
+    let calls = image_calls.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "/images/generations");
+    assert_eq!(
+        calls[0].2,
+        json!({
+            "prompt": "draw a secret sentinel",
+            "background": "auto",
+            "model": "gpt-image-2",
+            "quality": "auto",
+            "size": "auto"
+        })
+    );
+    assert_eq!(calls[0].1["authorization"], "Bearer managed-bearer");
+    assert_eq!(calls[0].1["chatgpt-account-id"], "managed-account");
+    assert_eq!(calls[0].1["x-openai-fedramp"], "true");
+    assert!(
+        !serde_json::to_string(&calls[0].2)
+            .expect("upstream body JSON")
+            .contains("peer-compatibility-key")
+    );
+    bridge_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn image_edit_accepts_five_data_images_and_rejects_invalid_inputs() {
+    let (upstream, image_calls, upstream_server) = start_image_upstream(false).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (responses_url, bridge_server) = start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        Some(upstream),
+    )
+    .await;
+    let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
+    let images = (0..5)
+        .map(|index| format!("data:image/png;base64,IMG{index}"))
+        .collect::<Vec<_>>();
+    let response = Client::new()
+        .post(&image_url)
+        .json(&json!({"prompt": "edit these", "images": images}))
+        .send()
+        .await
+        .expect("image edit response");
+    assert_eq!(response.status(), 200);
+    {
+        let upstream_calls = image_calls.lock().await;
+        let call = &upstream_calls[0];
+        assert_eq!(call.0, "/images/edits");
+        assert_eq!(
+            call.2["images"].as_array().expect("wrapped images").len(),
+            5
+        );
+        assert_eq!(
+            call.2["images"][0]["image_url"],
+            "data:image/png;base64,IMG0"
+        );
+    }
+
+    for request in [
+        json!({"prompt": "six", "images": ["data:image/png;base64,A", "data:image/png;base64,B", "data:image/png;base64,C", "data:image/png;base64,D", "data:image/png;base64,E", "data:image/png;base64,F"]}),
+        json!({"prompt": "remote", "images": ["https://example.test/image.png"]}),
+    ] {
+        let response = Client::new()
+            .post(&image_url)
+            .json(&request)
+            .send()
+            .await
+            .expect("invalid image response");
+        assert_eq!(response.status(), 400);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("invalid image body")
+                .contains("invalid_request_error")
+        );
+    }
+    assert_eq!(image_calls.lock().await.len(), 1);
+    bridge_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn image_errors_are_generic_and_do_not_echo_request_data() {
+    let (upstream, image_calls, upstream_server) = start_image_upstream(true).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (responses_url, bridge_server) = start_bridge_mode_with_image(
+        calls,
+        cancelled,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        Some(upstream),
+    )
+    .await;
+    let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
+    let response = Client::new()
+        .post(&image_url)
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"do-not-echo-this"}"#)
+        .send()
+        .await
+        .expect("upstream failure response");
+    assert_eq!(response.status(), 502);
+    let body = response.text().await.expect("upstream failure body");
+    assert!(body.contains("image operation failed"));
+    assert!(!body.contains("do-not-echo-this"));
+    assert_eq!(image_calls.lock().await.len(), 1);
+
+    let malformed = Client::new()
+        .post(&image_url)
+        .header("content-type", "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .expect("malformed image response");
+    assert_eq!(malformed.status(), 400);
+    assert!(
+        malformed
+            .text()
+            .await
+            .expect("malformed image body")
+            .contains("invalid_request_error")
+    );
+    bridge_server.abort();
+    upstream_server.abort();
 }
 
 #[tokio::test]
@@ -244,8 +558,17 @@ async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
 async fn native_output_items_keep_their_indices() {
     let calls = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) =
-        start_bridge_mode(calls.clone(), cancelled, false, false, true, None, None).await;
+    let (url, server) = start_bridge_mode(
+        calls.clone(),
+        cancelled,
+        false,
+        false,
+        true,
+        None,
+        None,
+        None,
+    )
+    .await;
     let body = Client::new()
         .post(&url)
         .json(&request())
@@ -391,6 +714,7 @@ async fn image_and_function_output_continuation_remain_typed() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let image_seen = Arc::new(AtomicBool::new(false));
     let output_seen = Arc::new(AtomicBool::new(false));
+    let output_image_seen = Arc::new(AtomicBool::new(false));
     let (url, server) = start_bridge_mode(
         calls.clone(),
         cancelled,
@@ -399,6 +723,7 @@ async fn image_and_function_output_continuation_remain_typed() {
         false,
         Some(image_seen.clone()),
         Some(output_seen.clone()),
+        Some(output_image_seen.clone()),
     )
     .await;
     let (mut socket, _) = connect_async(url.replacen("http", "ws", 1))
@@ -436,7 +761,10 @@ async fn image_and_function_output_continuation_remain_typed() {
                         {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
                     ]},
                     {"type":"function_call","id":"fc-test","name":"lookup","arguments": r#"{"city":"Paris"}"#,"call_id":"call-test"},
-                    {"type":"function_call_output","call_id":"call-test","output":"sunny"}
+                    {"type":"function_call_output","call_id":"call-test","output":[
+                        {"type":"input_text","text":"sunny"},
+                        {"type":"input_image","image_url":"data:image/png;base64,BBBB"}
+                    ]}
                 ],
                 "tools": [{"type":"function","name":"lookup","description":"look up weather","parameters":{"type":"object"}}]
             })
@@ -455,6 +783,7 @@ async fn image_and_function_output_continuation_remain_typed() {
     assert!(completed);
     assert!(image_seen.load(Ordering::SeqCst));
     assert!(output_seen.load(Ordering::SeqCst));
+    assert!(output_image_seen.load(Ordering::SeqCst));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
 }

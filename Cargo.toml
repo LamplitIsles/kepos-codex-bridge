@@ -6,10 +6,11 @@ rust-version = "1.85"
 publish = false
 
 [dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 clap = { version = "4.5.54", features = ["derive", "env"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 nanocodex-oai-api = { git = "https://github.com/gakonst/nanocodex", rev = "7068272602508100b166715b4dfa68c3c36cdf22", version = "0.5.0" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.17"
@@ -20,9 +21,6 @@ tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"]
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4", "fast-rng"] }
-
-[dev-dependencies]
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 
 [profile.release]
 opt-level = 3

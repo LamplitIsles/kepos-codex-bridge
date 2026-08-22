@@ -1,7 +1,8 @@
-//! Thin native Codex Responses relay for a loopback Kepos service.
+//! Thin native Codex relay for a loopback Kepos service.
 //!
-//! The bridge deliberately exposes only `/codex/responses`. Authentication is
-//! local managed ChatGPT OAuth; peer authentication belongs to Kepos.
+//! The bridge exposes native Responses and a client-independent image transport.
+//! Authentication is local managed ChatGPT OAuth; peer authentication belongs
+//! to Kepos.
 
 use std::{
     convert::Infallible,
@@ -21,11 +22,12 @@ use axum::{
         DefaultBodyLimit, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{Response as HttpResponse, StatusCode, header},
-    response::IntoResponse,
+    http::{HeaderMap, Response as HttpResponse, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use futures_util::StreamExt;
+use nanocodex_oai_api::auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot};
 use nanocodex_oai_api::{
     Model, OpenAi, ResponseEvent,
     responses::{
@@ -36,19 +38,28 @@ use nanocodex_oai_api::{
     tools::ToolDefinition,
     tower::ResponsesServiceFactory,
 };
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub const ENDPOINT: &str = "/codex/responses";
+pub const IMAGE_ENDPOINT: &str = "/codex/images";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EDIT_IMAGES: usize = 5;
 const CHANNEL_CAPACITY: usize = 32;
+const IMAGE_MODEL: &str = "gpt-image-2";
+const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 
 /// A configured bridge endpoint.
 #[derive(Clone)]
 pub struct Bridge<F> {
     openai: OpenAi<F>,
+    image_auth: OpenAiAuth,
+    image_client: reqwest::Client,
+    image_api_base_url: Arc<str>,
     model: Model,
     instructions: Arc<str>,
 }
@@ -69,6 +80,7 @@ where
     /// developer instruction used when a client omits `instructions`.
     pub fn new(
         openai: OpenAi<F>,
+        image_auth: OpenAiAuth,
         model: Model,
         instructions: impl Into<Arc<str>>,
     ) -> Result<Self, BridgeConfigError> {
@@ -78,9 +90,20 @@ where
         }
         Ok(Self {
             openai,
+            image_api_base_url: Arc::from(image_auth.mode().default_api_base_url()),
+            image_auth,
+            image_client: reqwest::Client::new(),
             model,
             instructions,
         })
+    }
+
+    /// Overrides the upstream image API base URL for an isolated deployment or
+    /// test-owned local listener. The public bridge contract remains fixed.
+    #[must_use]
+    pub fn with_image_api_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
+        self.image_api_base_url = base_url.into();
+        self
     }
 
     /// Returns the endpoint router. The router is loopback-agnostic; callers
@@ -90,9 +113,14 @@ where
         Router::new()
             .route(
                 ENDPOINT,
-                post(http_responses::<F>).get(websocket_responses::<F>),
+                post(http_responses::<F>)
+                    .get(websocket_responses::<F>)
+                    .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .route(
+                IMAGE_ENDPOINT,
+                post(http_images::<F>).layer(DefaultBodyLimit::max(MAX_IMAGE_REQUEST_BYTES)),
+            )
             .with_state(state)
     }
 
@@ -388,6 +416,196 @@ impl WireTool {
             parameters: JsonSchema::from(self.parameters),
             output_schema: None,
         })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageWireRequest {
+    prompt: String,
+    #[serde(default)]
+    images: Vec<String>,
+    /// Compatibility data accepted but never used for authorization.
+    #[serde(rename = "api_key", default)]
+    _api_key: Option<String>,
+}
+
+struct ImageOperation {
+    prompt: String,
+    images: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageResponse {
+    data: Vec<ImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageData {
+    b64_json: String,
+}
+
+fn parse_image_request(headers: &HeaderMap, raw: &[u8]) -> Result<ImageOperation, &'static str> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("application/json") {
+        return Err("content type must be application/json");
+    }
+    let request: ImageWireRequest =
+        serde_json::from_slice(raw).map_err(|_| "malformed or unsupported image request")?;
+    if request.prompt.trim().is_empty() {
+        return Err("prompt must not be blank");
+    }
+    if request.images.len() > MAX_EDIT_IMAGES {
+        return Err("images must contain at most five inputs");
+    }
+    if request.images.iter().any(|image| !is_data_image_url(image)) {
+        return Err("images must be data:image URLs");
+    }
+    Ok(ImageOperation {
+        prompt: request.prompt,
+        images: request.images,
+    })
+}
+
+fn is_data_image_url(value: &str) -> bool {
+    value
+        .strip_prefix("data:image/")
+        .and_then(|value| value.split_once(','))
+        .is_some_and(|(media_type, data)| !media_type.is_empty() && !data.is_empty())
+}
+
+fn image_error(status: StatusCode, message: &'static str) -> Response {
+    (
+        status,
+        axum::Json(json!({
+            "error": { "type": if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            }, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+async fn http_images<F>(
+    State(bridge): State<Arc<Bridge<F>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
+where
+    F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
+    F::Service: Service<
+            nanocodex_oai_api::tower::ResponsesAttempt,
+            Response = nanocodex_oai_api::tower::ResponsesServiceResponse,
+        > + Send
+        + 'static,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Error:
+        Into<nanocodex_oai_api::ResponseError> + Send,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
+{
+    let operation = match parse_image_request(&headers, &body) {
+        Ok(operation) => operation,
+        Err(message) => return image_error(StatusCode::BAD_REQUEST, message),
+    };
+    match bridge.perform_image(operation).await {
+        Ok(image_url) => axum::Json(json!({ "image_url": image_url })).into_response(),
+        Err(()) => image_error(StatusCode::BAD_GATEWAY, "image operation failed"),
+    }
+}
+
+impl<F> Bridge<F>
+where
+    F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
+    F::Service: Service<
+            nanocodex_oai_api::tower::ResponsesAttempt,
+            Response = nanocodex_oai_api::tower::ResponsesServiceResponse,
+        > + Send
+        + 'static,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Error:
+        Into<nanocodex_oai_api::ResponseError> + Send,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
+{
+    async fn perform_image(&self, operation: ImageOperation) -> Result<String, ()> {
+        let auth = self.image_auth.snapshot().await.map_err(|_| ())?;
+        let endpoint_kind = if operation.images.is_empty() {
+            "generations"
+        } else {
+            "edits"
+        };
+        let endpoint = format!(
+            "{}/images/{endpoint_kind}",
+            self.image_api_base_url.trim_end_matches('/')
+        );
+        let body = if operation.images.is_empty() {
+            json!({
+                "prompt": operation.prompt,
+                "background": "auto",
+                "model": IMAGE_MODEL,
+                "quality": "auto",
+                "size": "auto"
+            })
+        } else {
+            json!({
+                "images": operation.images.iter().map(|image| json!({ "image_url": image })).collect::<Vec<_>>(),
+                "prompt": operation.prompt,
+                "background": "auto",
+                "model": IMAGE_MODEL,
+                "quality": "auto",
+                "size": "auto"
+            })
+        };
+        let response = self.send_image_request(&endpoint, &body, &auth).await?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && auth.mode() == OpenAiAuthMode::ChatGpt
+        {
+            self.image_auth
+                .recover_unauthorized(&auth)
+                .await
+                .map_err(|_| ())?;
+            let refreshed = self.image_auth.snapshot().await.map_err(|_| ())?;
+            self.send_image_request(&endpoint, &body, &refreshed)
+                .await?
+        } else {
+            response
+        };
+        if !response.status().is_success() {
+            return Err(());
+        }
+        let decoded = response
+            .bytes()
+            .await
+            .map_err(|_| ())
+            .and_then(|body| serde_json::from_slice::<ImageResponse>(&body).map_err(|_| ()))?;
+        let image = decoded.data.into_iter().next().ok_or(())?;
+        if image.b64_json.trim().is_empty() {
+            return Err(());
+        }
+        Ok(format!("data:image/png;base64,{}", image.b64_json))
+    }
+
+    async fn send_image_request(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, ()> {
+        let mut request = self
+            .image_client
+            .post(endpoint)
+            .header(USER_AGENT, NANOCODEX_USER_AGENT)
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request.json(body).send().await.map_err(|_| ())
     }
 }
 
