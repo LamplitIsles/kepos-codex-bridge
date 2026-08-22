@@ -189,7 +189,7 @@ struct WireRequest {
 #[serde(untagged)]
 enum WireInput {
     Text(String),
-    Items(Vec<ResponseItem>),
+    Items(Vec<Value>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,7 +295,10 @@ impl WireRequest {
                 MessageRole::User,
                 [ContentItem::input_text(text)],
             )],
-            WireInput::Items(items) => items,
+            WireInput::Items(items) => items
+                .into_iter()
+                .map(lower_input_item)
+                .collect::<Result<_, _>>()?,
         };
         if items.is_empty() {
             return Err(BridgeError::InvalidRequest("input must not be empty"));
@@ -319,6 +322,21 @@ impl WireRequest {
             prompt_cache_key: self.prompt_cache_key,
         })
     }
+}
+
+fn lower_input_item(mut value: Value) -> Result<ResponseItem, BridgeError> {
+    if let Value::Object(item) = &mut value
+        && !item.contains_key("type")
+        && matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("user" | "assistant")
+        )
+        && item.contains_key("content")
+    {
+        item.insert("type".to_owned(), Value::String("message".to_owned()));
+    }
+    serde_json::from_value(value)
+        .map_err(|_| BridgeError::InvalidRequest("malformed or unsupported request"))
 }
 
 fn is_supported_input_item(item: &ResponseItem) -> bool {

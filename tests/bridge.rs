@@ -211,7 +211,10 @@ async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
             json!({
                 "type": "response.create",
                 "model": "gpt-5.6-luna",
-                "input": "hello"
+                "input": [{
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hello" }]
+                }]
             })
             .to_string()
             .into(),

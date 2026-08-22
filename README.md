@@ -101,20 +101,41 @@ Kepos service definition or in a client configuration.
 ## Pi and DSH configuration
 
 Configure the existing native `openai-codex-responses` provider to use the
-Kepos service URL as its base/endpoint, retain WebSocket transport or `auto`
-when supported, and provide any nonempty placeholder API key required by the
-client. The model must match the bridge's fixed model (the default is
-`gpt-5.6-luna`). No client-side OAuth login is configured.
+Kepos service URL at `/codex/responses`, with the fixed model
+`gpt-5.6-luna`. No client-side OAuth login is configured.
 
-Conceptually the client settings are:
+Pi 0.84.1 needs a syntactically JWT-shaped, non-secret placeholder because its
+native Codex adapter locally reads a `chatgpt_account_id` claim before it
+connects. The bridge ignores that value; it is never forwarded upstream. An
+arbitrary nonempty string such as `bridge-placeholder` is not sufficient for
+Pi. Use a test-owned Pi config directory containing:
 
-```text
-provider API: openai-codex-responses
-endpoint: <Kepos HTTP service URL>/codex/responses
-api key: bridge-placeholder        # compatibility value, not a secret
-transport: websocket (or auto)
-model: gpt-5.6-luna
+`models.json`:
+
+```json
+{
+  "providers": {
+    "openai-codex": {
+      "baseUrl": "<Kepos HTTP service URL>/codex/responses",
+      "apiKey": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoidGVzdC1hY2NvdW50In19.dummy"
+    }
+  }
+}
 ```
+
+`settings.json`:
+
+```json
+{
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.6-luna",
+  "transport": "websocket"
+}
+```
+
+Set `PI_CODING_AGENT_DIR` to that directory. Pi attempts WebSocket first and
+may fall back to SSE before its first event. Other clients should use whatever
+non-secret placeholder shape their own Codex adapter requires.
 
 Pi and DSH continue to send native function calls, receive them, execute tools
 locally, and send the native function-call output continuation. The bridge
