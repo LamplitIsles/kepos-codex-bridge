@@ -24,7 +24,7 @@ async fn start_bridge(
     cancelled: Arc<AtomicBool>,
     wait: bool,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    start_bridge_mode(calls, cancelled, wait, false, None, None).await
+    start_bridge_mode(calls, cancelled, wait, false, false, None, None).await
 }
 
 async fn start_bridge_mode(
@@ -32,6 +32,7 @@ async fn start_bridge_mode(
     cancelled: Arc<AtomicBool>,
     wait: bool,
     function_round: bool,
+    multi_output: bool,
     image_seen: Option<Arc<AtomicBool>>,
     output_seen: Option<Arc<AtomicBool>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -72,41 +73,65 @@ async fn start_bridge_mode(
                         let _guard = CancelGuard(cancelled);
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
-                    let item = if function_round && call_number == 0 {
-                        ResponseItem::FunctionCall {
-                            id: Some("fc-test".into()),
-                            name: "lookup".into(),
-                            namespace: None,
-                            arguments: r#"{"city":"Paris"}"#.into(),
-                            encrypted_function_args: None,
-                            call_id: "call-test".into(),
-                            caller: None,
-                            status: None,
-                            created_by: None,
-                            internal_chat_message_metadata_passthrough: None,
-                        }
+                    let items = if multi_output {
+                        vec![
+                            (
+                                ResponseItem::message(
+                                    MessageRole::Assistant,
+                                    [ContentItem::output_text("first output")],
+                                ),
+                                "first output",
+                            ),
+                            (
+                                ResponseItem::message(
+                                    MessageRole::Assistant,
+                                    [ContentItem::output_text("second output")],
+                                ),
+                                "second output",
+                            ),
+                        ]
                     } else {
-                        ResponseItem::message(
-                            MessageRole::Assistant,
-                            [ContentItem::output_text("bridge text")],
-                        )
+                        vec![(
+                            if function_round && call_number == 0 {
+                                ResponseItem::FunctionCall {
+                                    id: Some("fc-test".into()),
+                                    name: "lookup".into(),
+                                    namespace: None,
+                                    arguments: r#"{"city":"Paris"}"#.into(),
+                                    encrypted_function_args: None,
+                                    call_id: "call-test".into(),
+                                    caller: None,
+                                    status: None,
+                                    created_by: None,
+                                    internal_chat_message_metadata_passthrough: None,
+                                }
+                            } else {
+                                ResponseItem::message(
+                                    MessageRole::Assistant,
+                                    [ContentItem::output_text("bridge text")],
+                                )
+                            },
+                            "bridge text",
+                        )]
                     };
-                    attempt
-                        .emit(ResponseEvent::OutputItemAdded(item.clone()))
-                        .await;
-                    attempt
-                        .emit(ResponseEvent::OutputTextDelta("bridge text".to_owned()))
-                        .await;
-                    attempt
-                        .emit(ResponseEvent::OutputItemDone(item.clone()))
-                        .await;
+                    for (item, delta) in &items {
+                        attempt
+                            .emit(ResponseEvent::OutputItemAdded(item.clone()))
+                            .await;
+                        attempt
+                            .emit(ResponseEvent::OutputTextDelta((*delta).to_owned()))
+                            .await;
+                        attempt
+                            .emit(ResponseEvent::OutputItemDone(item.clone()))
+                            .await;
+                    }
                     Ok::<_, ResponseError>(ResponsesServiceResponse::new(
                         ResponsesOutput::Generation(GenerationOutput {
                             id: "upstream-response".to_owned(),
                             status: "completed".to_owned(),
                             end_turn: Some(true),
                             final_message: Some("bridge text".to_owned()),
-                            output_items: vec![item],
+                            output_items: items.into_iter().map(|(item, _)| item).collect(),
                             code_calls: Vec::new(),
                             usage: None,
                             time_to_first_event_ns: 0,
@@ -139,6 +164,16 @@ fn request() -> Value {
         "stream": true,
         "api_key": "dummy-key-must-not-echo"
     })
+}
+
+async fn wait_until_cancelled(cancelled: &AtomicBool) {
+    for _ in 0..50 {
+        if cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(cancelled.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -203,7 +238,43 @@ async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
 }
 
 #[tokio::test]
-async fn unsupported_values_are_framed_and_disconnect_cancels_upstream() {
+async fn native_output_items_keep_their_indices() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (url, server) =
+        start_bridge_mode(calls.clone(), cancelled, false, false, true, None, None).await;
+    let body = Client::new()
+        .post(&url)
+        .json(&request())
+        .send()
+        .await
+        .expect("multi-output response")
+        .text()
+        .await
+        .expect("multi-output SSE body");
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    for event_type in [
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_item.done",
+    ] {
+        let indices = events
+            .iter()
+            .filter(|event| event["type"] == event_type)
+            .map(|event| event["output_index"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(indices, [Some(0), Some(1)]);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn invalid_input_and_downstream_cancellation_stop_upstream() {
     let calls = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
     let (url, server) = start_bridge(calls.clone(), cancelled.clone(), true).await;
@@ -223,8 +294,55 @@ async fn unsupported_values_are_framed_and_disconnect_cancels_upstream() {
     assert!(body.contains("invalid_request_error"));
     assert!(!body.contains("secret-sentinel"));
 
+    let mut previous_request = request();
+    previous_request["previous_response_id"] = Value::String("resp_missing".to_owned());
+    let response = client
+        .post(&url)
+        .json(&previous_request)
+        .send()
+        .await
+        .expect("previous-response rejection");
+    assert_eq!(response.status(), 400);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("previous-response error body")
+            .contains("previous_response_id is only supported on WebSocket")
+    );
+
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "model": "gpt-5.6-luna",
+            "input": [{"type": "compaction_trigger"}]
+        }))
+        .send()
+        .await
+        .expect("rich-input rejection");
+    assert_eq!(response.status(), 400);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("rich-input error body")
+            .contains("input item is outside the supported subset")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let response = client
+        .post(&url)
+        .json(&request())
+        .send()
+        .await
+        .expect("HTTP streaming response");
+    assert_eq!(response.status(), 200);
+    drop(response);
+    wait_until_cancelled(&cancelled).await;
+
+    cancelled.store(false, Ordering::SeqCst);
     let ws_url = url.replacen("http", "ws", 1);
-    let (mut socket, _) = connect_async(ws_url).await.expect("WebSocket connection");
+    let (mut socket, _) = connect_async(&ws_url).await.expect("WebSocket connection");
     socket
         .send(Message::Text(
             json!({
@@ -238,14 +356,29 @@ async fn unsupported_values_are_framed_and_disconnect_cancels_upstream() {
         .await
         .expect("request frame");
     let _ = socket.next().await;
+    socket
+        .send(Message::Text("{\"type\":\"response.cancel\"}".into()))
+        .await
+        .expect("cancel frame");
+    wait_until_cancelled(&cancelled).await;
+
+    cancelled.store(false, Ordering::SeqCst);
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create",
+                "model": "gpt-5.6-luna",
+                "input": "disconnect me"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("fresh request after cancellation");
+    let _ = socket.next().await;
     socket.close(None).await.expect("close socket");
-    for _ in 0..50 {
-        if cancelled.load(Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(cancelled.load(Ordering::SeqCst));
+    wait_until_cancelled(&cancelled).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     server.abort();
 }
 
@@ -260,6 +393,7 @@ async fn image_and_function_output_continuation_remain_typed() {
         cancelled,
         false,
         true,
+        false,
         Some(image_seen.clone()),
         Some(output_seen.clone()),
     )

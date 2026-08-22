@@ -9,9 +9,9 @@ execution, and cancellation decisions.
 
 The only public route is `/codex/responses`.
 
-- `POST` accepts the streaming native Responses request and returns
-  `text/event-stream`; events are `data: {native JSON}\n\n` followed by
-  `data: [DONE]\n\n`.
+- `POST` accepts a full streaming native Responses request (it rejects
+  `previous_response_id`) and returns `text/event-stream`; events are
+  `data: {native JSON}\n\n` followed by `data: [DONE]\n\n`.
 - WebSocket upgrade on the same route accepts text `response.create` frames and
   returns native response event frames. `response.cancel` cancels the active
   operation.

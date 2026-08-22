@@ -28,7 +28,10 @@ use axum::{
 use futures_util::StreamExt;
 use nanocodex_oai_api::{
     Model, OpenAi, ResponseEvent,
-    responses::{ContentItem, JsonSchema, MessageRole, ResponseItem},
+    responses::{
+        ContentItem, FunctionOutputBody, FunctionOutputContent, JsonSchema, MessageRole,
+        ResponseItem,
+    },
     session::{ResponseInput, Session},
     tools::ToolDefinition,
     tower::ResponsesServiceFactory,
@@ -159,7 +162,7 @@ struct WireRequest {
     stream: Option<bool>,
     #[serde(default)]
     #[serde(rename = "previous_response_id")]
-    _previous_response_id: Option<String>,
+    previous_response_id: Option<String>,
     #[serde(default)]
     tool_choice: Option<Value>,
     #[serde(rename = "parallel_tool_calls", default)]
@@ -221,6 +224,11 @@ impl WireRequest {
         if !websocket && request.kind.is_some() {
             return Err(BridgeError::InvalidRequest(
                 "HTTP requests must not contain a frame type",
+            ));
+        }
+        if !websocket && request.previous_response_id.is_some() {
+            return Err(BridgeError::InvalidRequest(
+                "previous_response_id is only supported on WebSocket",
             ));
         }
         if request.model.parse::<Model>().ok() != Some(expected_model) {
@@ -293,29 +301,10 @@ impl WireRequest {
             return Err(BridgeError::InvalidRequest("input must not be empty"));
         }
         for item in &items {
-            if matches!(
-                item,
-                ResponseItem::Other(_) | ResponseItem::ImageGenerationCall { .. }
-            ) {
+            if !is_supported_input_item(item) {
                 return Err(BridgeError::InvalidRequest(
                     "input item is outside the supported subset",
                 ));
-            }
-            if let ResponseItem::Message { role, content, .. } = item {
-                if matches!(role, MessageRole::Developer) {
-                    return Err(BridgeError::InvalidRequest(
-                        "developer input items are unsupported",
-                    ));
-                }
-                if matches!(role, MessageRole::User)
-                    && content
-                        .iter()
-                        .any(|content| matches!(content, ContentItem::OutputText { .. }))
-                {
-                    return Err(BridgeError::InvalidRequest(
-                        "output content is not valid user input",
-                    ));
-                }
             }
         }
         let tools = self
@@ -329,6 +318,40 @@ impl WireRequest {
             tools,
             prompt_cache_key: self.prompt_cache_key,
         })
+    }
+}
+
+fn is_supported_input_item(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message {
+            role: MessageRole::User,
+            content,
+            ..
+        } => content.iter().all(|content| {
+            matches!(
+                content,
+                ContentItem::InputText { .. } | ContentItem::InputImage { .. }
+            )
+        }),
+        ResponseItem::Message {
+            role: MessageRole::Assistant,
+            content,
+            ..
+        } => content
+            .iter()
+            .all(|content| matches!(content, ContentItem::OutputText { .. })),
+        ResponseItem::Reasoning { .. } | ResponseItem::FunctionCall { .. } => true,
+        ResponseItem::FunctionCallOutput { output, .. } => match output {
+            FunctionOutputBody::Text(_) => true,
+            FunctionOutputBody::Content(content) => content.iter().all(|content| {
+                matches!(
+                    content,
+                    FunctionOutputContent::InputText { .. }
+                        | FunctionOutputContent::InputImage { .. }
+                )
+            }),
+        },
+        _ => false,
     }
 }
 
@@ -518,7 +541,14 @@ where
     let mut response = turn.create(ResponseInput::items(items));
     let response_id = format!("resp_bridge_{}", uuid::Uuid::new_v4().simple());
     let mut output_items = Vec::new();
-    while let Some(event) = response.next().await {
+    loop {
+        let event = tokio::select! {
+            _ = sender.closed() => return Err("client disconnected"),
+            event = response.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         let event = event.map_err(|_| "upstream operation failed")?;
         if let Some(value) = native_event(event, &response_id, &mut output_items) {
             sender
@@ -586,6 +616,13 @@ fn input_delta(
     }
 }
 
+fn response_items_match(left: &ResponseItem, right: &ResponseItem) -> bool {
+    match (left.id(), right.id()) {
+        (Some(left), Some(right)) => left == right,
+        _ => serde_json::to_value(left).ok() == serde_json::to_value(right).ok(),
+    }
+}
+
 fn native_event(
     event: ResponseEvent,
     response_id: &str,
@@ -603,20 +640,28 @@ fn native_event(
                 json!({ "type": "response.output_item.added", "output_index": index, "item": item }),
             )
         }
-        ResponseEvent::OutputTextDelta(delta) => {
-            Some(json!({ "type": "response.output_text.delta", "output_index": 0, "delta": delta }))
-        }
+        ResponseEvent::OutputTextDelta(delta) => Some(json!({
+            "type": "response.output_text.delta",
+            "output_index": output.len().saturating_sub(1),
+            "delta": delta
+        })),
         ResponseEvent::ToolCallInputDelta {
             item_id,
             call_id,
             delta,
-        } => Some(json!({
-            "type": "response.custom_tool_call_input.delta",
-            "output_index": 0,
-            "item_id": item_id,
-            "call_id": call_id,
-            "delta": delta
-        })),
+        } => {
+            let index = output
+                .iter()
+                .position(|item| item.id().is_some_and(|id| id.as_str() == item_id.as_str()))
+                .unwrap_or_else(|| output.len().saturating_sub(1));
+            Some(json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": index,
+                "item_id": item_id,
+                "call_id": call_id,
+                "delta": delta
+            }))
+        }
         ResponseEvent::ReasoningSummaryDelta {
             delta,
             summary_index,
@@ -648,16 +693,15 @@ fn native_event(
             "summary_index": summary_index
         })),
         ResponseEvent::OutputItemDone(item) => {
-            if !output.iter().any(|known| {
-                known.id() == item.id()
-                    && (item.id().is_some()
-                        || serde_json::to_value(known).ok() == serde_json::to_value(&item).ok())
-            }) {
+            if !output
+                .iter()
+                .any(|known| response_items_match(known, &item))
+            {
                 output.push(item.clone());
             }
             let index = output
                 .iter()
-                .position(|known| known.id() == item.id())
+                .position(|known| response_items_match(known, &item))
                 .unwrap_or(0);
             Some(
                 json!({ "type": "response.output_item.done", "output_index": index, "item": item }),
@@ -712,6 +756,7 @@ where
                         Some(Ok(Message::Text(text))) => {
                             if let Ok(value) = serde_json::from_str::<Value>(&text) && value.get("type").and_then(Value::as_str) == Some("response.cancel") {
                                 if let Some(operation) = active.take() { operation.task.abort(); }
+                                session = None;
                             } else if socket.send(Message::Text(error_value("one response may be active at a time").to_string().into())).await.is_err() { return; }
                         }
                         Some(Ok(Message::Close(_))) | None => { operation.task.abort(); return; }
