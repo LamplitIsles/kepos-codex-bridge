@@ -6,6 +6,7 @@
 
 use std::{
     convert::Infallible,
+    io::Read,
     net::SocketAddr,
     sync::{
         Arc,
@@ -611,7 +612,11 @@ where
     }
 }
 
-async fn http_responses<F>(State(bridge): State<Arc<Bridge<F>>>, body: Bytes) -> impl IntoResponse
+async fn http_responses<F>(
+    State(bridge): State<Arc<Bridge<F>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse
 where
     F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
     F::Service: Service<
@@ -623,7 +628,9 @@ where
         Into<nanocodex_oai_api::ResponseError> + Send,
     <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
 {
-    let parsed = WireRequest::parse(&body, false, bridge.model).and_then(WireRequest::lower);
+    let parsed = decode_response_body(&headers, body)
+        .and_then(|body| WireRequest::parse(&body, false, bridge.model))
+        .and_then(WireRequest::lower);
     let (status, receiver) = match parsed {
         Ok(request) => match bridge.new_session(
             request.instructions.as_deref(),
@@ -666,6 +673,31 @@ where
     <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
 {
     upgrade.on_upgrade(move |socket| websocket_loop(bridge, socket))
+}
+
+fn decode_response_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, BridgeError> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match encoding {
+        None | Some("identity") => Ok(body),
+        Some("zstd") => {
+            let decoder = zstd::stream::read::Decoder::new(body.as_ref())
+                .map_err(|_| BridgeError::InvalidRequest("invalid zstd request body"))?;
+            let mut decoded = Vec::with_capacity(MAX_REQUEST_BYTES.min(body.len()));
+            decoder
+                .take((MAX_REQUEST_BYTES as u64) + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|_| BridgeError::InvalidRequest("invalid zstd request body"))?;
+            if decoded.len() > MAX_REQUEST_BYTES {
+                return Err(BridgeError::InvalidRequest("request body is too large"));
+            }
+            Ok(Bytes::from(decoded))
+        }
+        Some(_) => Err(BridgeError::InvalidRequest("unsupported content encoding")),
+    }
 }
 
 fn sse_response(status: StatusCode, receiver: mpsc::Receiver<Value>) -> HttpResponse<Body> {

@@ -688,6 +688,73 @@ async fn native_output_items_keep_their_indices() {
 }
 
 #[tokio::test]
+async fn http_sse_accepts_zstd_and_limits_expanded_requests() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (url, server) = start_bridge(calls.clone(), cancelled, false).await;
+    let client = Client::new();
+
+    let body = serde_json::to_vec(&request()).expect("request JSON");
+    let compressed = zstd::stream::encode_all(body.as_slice(), 3).expect("compressed request");
+    let response = client
+        .post(&url)
+        .header("content-encoding", "zstd")
+        .body(compressed)
+        .send()
+        .await
+        .expect("zstd response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("zstd SSE body")
+            .contains("response.completed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let mut oversized = request();
+    oversized["input"] = Value::String("x".repeat(4 * 1024 * 1024));
+    let body = serde_json::to_vec(&oversized).expect("oversized request JSON");
+    let compressed =
+        zstd::stream::encode_all(body.as_slice(), 3).expect("compressed oversized request");
+    let response = client
+        .post(&url)
+        .header("content-encoding", "zstd")
+        .body(compressed)
+        .send()
+        .await
+        .expect("oversized zstd response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("oversized error body")
+            .contains("request body is too large")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let response = client
+        .post(&url)
+        .header("content-encoding", "gzip")
+        .body(serde_json::to_vec(&request()).expect("plain request JSON"))
+        .send()
+        .await
+        .expect("unsupported encoding response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("unsupported encoding error body")
+            .contains("unsupported content encoding")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn invalid_input_and_downstream_cancellation_stop_upstream() {
     let calls = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));

@@ -21,6 +21,7 @@ tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"]
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4", "fast-rng"] }
+zstd = { version = "0.13.3", default-features = false }
 
 [profile.release]
 opt-level = 3
