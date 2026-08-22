@@ -1,10 +1,12 @@
-//! Thin native Codex Responses relay for a loopback Kepos service.
+//! Thin native Codex relay for a loopback Kepos service.
 //!
-//! The bridge deliberately exposes only `/codex/responses`. Authentication is
-//! local managed ChatGPT OAuth; peer authentication belongs to Kepos.
+//! The bridge exposes native Responses and a client-independent image transport.
+//! Authentication is local managed ChatGPT OAuth; peer authentication belongs
+//! to Kepos.
 
 use std::{
     convert::Infallible,
+    io::Read,
     net::SocketAddr,
     sync::{
         Arc,
@@ -21,11 +23,12 @@ use axum::{
         DefaultBodyLimit, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{Response as HttpResponse, StatusCode, header},
-    response::IntoResponse,
+    http::{HeaderMap, Response as HttpResponse, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use futures_util::StreamExt;
+use nanocodex_oai_api::auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot};
 use nanocodex_oai_api::{
     Model, OpenAi, ResponseEvent,
     responses::{
@@ -36,19 +39,28 @@ use nanocodex_oai_api::{
     tools::ToolDefinition,
     tower::ResponsesServiceFactory,
 };
+use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 pub const ENDPOINT: &str = "/codex/responses";
+pub const IMAGE_ENDPOINT: &str = "/codex/images";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EDIT_IMAGES: usize = 5;
 const CHANNEL_CAPACITY: usize = 32;
+const IMAGE_MODEL: &str = "gpt-image-2";
+const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 
 /// A configured bridge endpoint.
 #[derive(Clone)]
 pub struct Bridge<F> {
     openai: OpenAi<F>,
+    image_auth: OpenAiAuth,
+    image_client: reqwest::Client,
+    image_api_base_url: Arc<str>,
     model: Model,
     instructions: Arc<str>,
 }
@@ -69,6 +81,7 @@ where
     /// developer instruction used when a client omits `instructions`.
     pub fn new(
         openai: OpenAi<F>,
+        image_auth: OpenAiAuth,
         model: Model,
         instructions: impl Into<Arc<str>>,
     ) -> Result<Self, BridgeConfigError> {
@@ -78,9 +91,20 @@ where
         }
         Ok(Self {
             openai,
+            image_api_base_url: Arc::from(image_auth.mode().default_api_base_url()),
+            image_auth,
+            image_client: reqwest::Client::new(),
             model,
             instructions,
         })
+    }
+
+    /// Overrides the upstream image API base URL for an isolated deployment or
+    /// test-owned local listener. The public bridge contract remains fixed.
+    #[must_use]
+    pub fn with_image_api_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
+        self.image_api_base_url = base_url.into();
+        self
     }
 
     /// Returns the endpoint router. The router is loopback-agnostic; callers
@@ -90,9 +114,14 @@ where
         Router::new()
             .route(
                 ENDPOINT,
-                post(http_responses::<F>).get(websocket_responses::<F>),
+                post(http_responses::<F>)
+                    .get(websocket_responses::<F>)
+                    .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .route(
+                IMAGE_ENDPOINT,
+                post(http_images::<F>).layer(DefaultBodyLimit::max(MAX_IMAGE_REQUEST_BYTES)),
+            )
             .with_state(state)
     }
 
@@ -201,7 +230,7 @@ struct WireTool {
     #[serde(default)]
     description: String,
     #[serde(default)]
-    strict: bool,
+    strict: Option<bool>,
     parameters: Value,
 }
 
@@ -210,6 +239,7 @@ struct ParsedRequest {
     instructions: Option<String>,
     tools: Vec<ToolDefinition>,
     prompt_cache_key: Option<String>,
+    previous_response_id: Option<String>,
 }
 
 impl WireRequest {
@@ -320,6 +350,7 @@ impl WireRequest {
             instructions: self.instructions,
             tools,
             prompt_cache_key: self.prompt_cache_key,
+            previous_response_id: self.previous_response_id,
         })
     }
 }
@@ -383,7 +414,7 @@ impl WireTool {
         Ok(ToolDefinition::Function {
             name: self.name.into_boxed_str(),
             description: self.description.into_boxed_str(),
-            strict: self.strict,
+            strict: self.strict.unwrap_or(false),
             defer_loading: None,
             parameters: JsonSchema::from(self.parameters),
             output_schema: None,
@@ -391,7 +422,84 @@ impl WireTool {
     }
 }
 
-async fn http_responses<F>(State(bridge): State<Arc<Bridge<F>>>, body: Bytes) -> impl IntoResponse
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImageWireRequest {
+    prompt: String,
+    #[serde(default)]
+    images: Vec<String>,
+    /// Compatibility data accepted but never used for authorization.
+    #[serde(rename = "api_key", default)]
+    _api_key: Option<String>,
+}
+
+struct ImageOperation {
+    prompt: String,
+    images: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageResponse {
+    data: Vec<ImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageData {
+    b64_json: String,
+}
+
+fn parse_image_request(headers: &HeaderMap, raw: &[u8]) -> Result<ImageOperation, &'static str> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if content_type != Some("application/json") {
+        return Err("content type must be application/json");
+    }
+    let request: ImageWireRequest =
+        serde_json::from_slice(raw).map_err(|_| "malformed or unsupported image request")?;
+    if request.prompt.trim().is_empty() {
+        return Err("prompt must not be blank");
+    }
+    if request.images.len() > MAX_EDIT_IMAGES {
+        return Err("images must contain at most five inputs");
+    }
+    if request.images.iter().any(|image| !is_data_image_url(image)) {
+        return Err("images must be data:image URLs");
+    }
+    Ok(ImageOperation {
+        prompt: request.prompt,
+        images: request.images,
+    })
+}
+
+fn is_data_image_url(value: &str) -> bool {
+    value
+        .strip_prefix("data:image/")
+        .and_then(|value| value.split_once(','))
+        .is_some_and(|(media_type, data)| !media_type.is_empty() && !data.is_empty())
+}
+
+fn image_error(status: StatusCode, message: &'static str) -> Response {
+    (
+        status,
+        axum::Json(json!({
+            "error": { "type": if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            }, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+async fn http_images<F>(
+    State(bridge): State<Arc<Bridge<F>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response
 where
     F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
     F::Service: Service<
@@ -403,7 +511,126 @@ where
         Into<nanocodex_oai_api::ResponseError> + Send,
     <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
 {
-    let parsed = WireRequest::parse(&body, false, bridge.model).and_then(WireRequest::lower);
+    let operation = match parse_image_request(&headers, &body) {
+        Ok(operation) => operation,
+        Err(message) => return image_error(StatusCode::BAD_REQUEST, message),
+    };
+    match bridge.perform_image(operation).await {
+        Ok(image_url) => axum::Json(json!({ "image_url": image_url })).into_response(),
+        Err(()) => image_error(StatusCode::BAD_GATEWAY, "image operation failed"),
+    }
+}
+
+impl<F> Bridge<F>
+where
+    F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
+    F::Service: Service<
+            nanocodex_oai_api::tower::ResponsesAttempt,
+            Response = nanocodex_oai_api::tower::ResponsesServiceResponse,
+        > + Send
+        + 'static,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Error:
+        Into<nanocodex_oai_api::ResponseError> + Send,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
+{
+    async fn perform_image(&self, operation: ImageOperation) -> Result<String, ()> {
+        let auth = self.image_auth.snapshot().await.map_err(|_| ())?;
+        let endpoint_kind = if operation.images.is_empty() {
+            "generations"
+        } else {
+            "edits"
+        };
+        let endpoint = format!(
+            "{}/images/{endpoint_kind}",
+            self.image_api_base_url.trim_end_matches('/')
+        );
+        let body = if operation.images.is_empty() {
+            json!({
+                "prompt": operation.prompt,
+                "background": "auto",
+                "model": IMAGE_MODEL,
+                "quality": "auto",
+                "size": "auto"
+            })
+        } else {
+            json!({
+                "images": operation.images.iter().map(|image| json!({ "image_url": image })).collect::<Vec<_>>(),
+                "prompt": operation.prompt,
+                "background": "auto",
+                "model": IMAGE_MODEL,
+                "quality": "auto",
+                "size": "auto"
+            })
+        };
+        let response = self.send_image_request(&endpoint, &body, &auth).await?;
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && auth.mode() == OpenAiAuthMode::ChatGpt
+        {
+            self.image_auth
+                .recover_unauthorized(&auth)
+                .await
+                .map_err(|_| ())?;
+            let refreshed = self.image_auth.snapshot().await.map_err(|_| ())?;
+            self.send_image_request(&endpoint, &body, &refreshed)
+                .await?
+        } else {
+            response
+        };
+        if !response.status().is_success() {
+            return Err(());
+        }
+        let decoded = response
+            .bytes()
+            .await
+            .map_err(|_| ())
+            .and_then(|body| serde_json::from_slice::<ImageResponse>(&body).map_err(|_| ()))?;
+        let image = decoded.data.into_iter().next().ok_or(())?;
+        if image.b64_json.trim().is_empty() {
+            return Err(());
+        }
+        Ok(format!("data:image/png;base64,{}", image.b64_json))
+    }
+
+    async fn send_image_request(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, ()> {
+        let mut request = self
+            .image_client
+            .post(endpoint)
+            .header(USER_AGENT, NANOCODEX_USER_AGENT)
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request.json(body).send().await.map_err(|_| ())
+    }
+}
+
+async fn http_responses<F>(
+    State(bridge): State<Arc<Bridge<F>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse
+where
+    F: ResponsesServiceFactory + Clone + Send + Sync + 'static,
+    F::Service: Service<
+            nanocodex_oai_api::tower::ResponsesAttempt,
+            Response = nanocodex_oai_api::tower::ResponsesServiceResponse,
+        > + Send
+        + 'static,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Error:
+        Into<nanocodex_oai_api::ResponseError> + Send,
+    <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
+{
+    let parsed = decode_response_body(&headers, body)
+        .and_then(|body| WireRequest::parse(&body, false, bridge.model))
+        .and_then(WireRequest::lower);
     let (status, receiver) = match parsed {
         Ok(request) => match bridge.new_session(
             request.instructions.as_deref(),
@@ -415,9 +642,13 @@ where
                     session: Mutex::new(session),
                     last_input: Mutex::new(Vec::new()),
                     last_output: Mutex::new(Vec::new()),
+                    last_response_id: Mutex::new(None),
                     failed: AtomicBool::new(false),
                 });
-                (StatusCode::OK, spawn_operation(state, request.items))
+                (
+                    StatusCode::OK,
+                    spawn_operation(state, request.items, request.previous_response_id),
+                )
             }
             Err(error) => (StatusCode::BAD_REQUEST, error_receiver(error)),
         },
@@ -442,6 +673,31 @@ where
     <F::Service as Service<nanocodex_oai_api::tower::ResponsesAttempt>>::Future: Send,
 {
     upgrade.on_upgrade(move |socket| websocket_loop(bridge, socket))
+}
+
+fn decode_response_body(headers: &HeaderMap, body: Bytes) -> Result<Bytes, BridgeError> {
+    let encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match encoding {
+        None | Some("identity") => Ok(body),
+        Some("zstd") => {
+            let decoder = zstd::stream::read::Decoder::new(body.as_ref())
+                .map_err(|_| BridgeError::InvalidRequest("invalid zstd request body"))?;
+            let mut decoded = Vec::with_capacity(MAX_REQUEST_BYTES.min(body.len()));
+            decoder
+                .take((MAX_REQUEST_BYTES as u64) + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|_| BridgeError::InvalidRequest("invalid zstd request body"))?;
+            if decoded.len() > MAX_REQUEST_BYTES {
+                return Err(BridgeError::InvalidRequest("request body is too large"));
+            }
+            Ok(Bytes::from(decoded))
+        }
+        Some(_) => Err(BridgeError::InvalidRequest("unsupported content encoding")),
+    }
 }
 
 fn sse_response(status: StatusCode, receiver: mpsc::Receiver<Value>) -> HttpResponse<Body> {
@@ -488,6 +744,7 @@ struct ConnectionState<S> {
     session: Mutex<Session<S>>,
     last_input: Mutex<Vec<ResponseItem>>,
     last_output: Mutex<Vec<ResponseItem>>,
+    last_response_id: Mutex<Option<String>>,
     failed: AtomicBool,
 }
 
@@ -499,6 +756,7 @@ struct Operation {
 fn spawn_operation<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
 ) -> mpsc::Receiver<Value>
 where
     S: tower::Service<
@@ -509,12 +767,13 @@ where
     S::Error: Into<nanocodex_oai_api::ResponseError> + Send,
     S::Future: Send,
 {
-    spawn_operation_with_handle(state, items).receiver
+    spawn_operation_with_handle(state, items, previous_response_id).receiver
 }
 
 fn spawn_operation_with_handle<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
 ) -> Operation
 where
     S: tower::Service<
@@ -528,7 +787,9 @@ where
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let task = tokio::spawn(async move {
         let failed_state = Arc::clone(&state);
-        if let Err(error) = drive_operation(state, items, sender.clone()).await {
+        if let Err(error) =
+            drive_operation(state, items, previous_response_id, sender.clone()).await
+        {
             failed_state.failed.store(true, Ordering::Release);
             let _ = sender.send(upstream_error_value(error)).await;
         }
@@ -539,6 +800,7 @@ where
 async fn drive_operation<S>(
     state: Arc<ConnectionState<S>>,
     items: Vec<ResponseItem>,
+    previous_response_id: Option<String>,
     sender: mpsc::Sender<Value>,
 ) -> Result<(), &'static str>
 where
@@ -551,9 +813,15 @@ where
     S::Future: Send,
 {
     let request_items = items;
-    let previous_input = state.last_input.lock().await.clone();
-    let previous_output = state.last_output.lock().await.clone();
-    let items = input_delta(request_items.clone(), &previous_input, &previous_output);
+    let can_delta = previous_response_id.is_some()
+        && previous_response_id == *state.last_response_id.lock().await;
+    let items = if can_delta {
+        let previous_input = state.last_input.lock().await.clone();
+        let previous_output = state.last_output.lock().await.clone();
+        input_delta(request_items.clone(), &previous_input, &previous_output)
+    } else {
+        request_items.clone()
+    };
     let mut session = state.session.lock().await;
     let mut turn = session.turn();
     let mut response = turn.create(ResponseInput::items(items));
@@ -581,6 +849,7 @@ where
     }
     *state.last_output.lock().await = completed.output().to_vec();
     *state.last_input.lock().await = request_items;
+    *state.last_response_id.lock().await = Some(response_id.clone());
     let terminal = json!({
         "type": "response.completed",
         "response": {
@@ -641,6 +910,23 @@ fn response_items_match(left: &ResponseItem, right: &ResponseItem) -> bool {
     }
 }
 
+fn reasoning_output_index(output: &[ResponseItem], item_id: Option<&str>) -> usize {
+    item_id
+        .and_then(|item_id| {
+            output
+                .iter()
+                .position(|item| item.id().is_some_and(|id| id.as_str() == item_id))
+        })
+        .unwrap_or_else(|| output.len().saturating_sub(1))
+}
+
+fn reasoning_item_id(output: &[ResponseItem], output_index: usize) -> Option<String> {
+    output
+        .get(output_index)
+        .and_then(ResponseItem::id)
+        .map(|id| id.as_str().to_owned())
+}
+
 fn native_event(
     event: ResponseEvent,
     response_id: &str,
@@ -683,29 +969,43 @@ fn native_event(
         ResponseEvent::ReasoningSummaryDelta {
             delta,
             summary_index,
-        } => Some(json!({
-            "type": "response.reasoning_summary_text.delta",
-            "summary_index": summary_index,
-            "delta": delta
-        })),
+        } => {
+            let output_index = output.len().saturating_sub(1);
+            Some(json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": reasoning_item_id(output, output_index),
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta
+            }))
+        }
         ResponseEvent::ReasoningSummaryDone {
             item_id,
             text,
             summary_index,
-        } => Some(json!({
-            "type": "response.reasoning_summary_text.done",
-            "item_id": item_id,
-            "summary_index": summary_index,
-            "text": text
-        })),
+        } => {
+            let output_index = reasoning_output_index(output, Some(item_id.as_str()));
+            Some(json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "text": text
+            }))
+        }
         ResponseEvent::ReasoningContentDelta {
             delta,
             content_index,
-        } => Some(json!({
-            "type": "response.reasoning_text.delta",
-            "content_index": content_index,
-            "delta": delta
-        })),
+        } => {
+            let output_index = output.len().saturating_sub(1);
+            Some(json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": reasoning_item_id(output, output_index),
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": delta
+            }))
+        }
         ResponseEvent::ReasoningSummaryPartAdded { summary_index } => Some(json!({
             "type": "response.reasoning_summary_part.added",
             "summary_index": summary_index
@@ -791,9 +1091,17 @@ where
                     .and_then(WireRequest::lower);
                 match parsed {
                     Ok(request) => {
-                        let state = match &session {
-                            Some(state) => Arc::clone(state),
-                            None => match bridge.new_session(
+                        let reuse = if let Some(state) = &session {
+                            request.previous_response_id.is_some()
+                                && request.previous_response_id.as_deref()
+                                    == state.last_response_id.lock().await.as_deref()
+                        } else {
+                            false
+                        };
+                        let state = if reuse {
+                            Arc::clone(session.as_ref().expect("reused session"))
+                        } else {
+                            match bridge.new_session(
                                 request.instructions.as_deref(),
                                 request.tools,
                                 request.prompt_cache_key.as_deref(),
@@ -803,6 +1111,7 @@ where
                                         session: Mutex::new(new_session),
                                         last_input: Mutex::new(Vec::new()),
                                         last_output: Mutex::new(Vec::new()),
+                                        last_response_id: Mutex::new(None),
                                         failed: AtomicBool::new(false),
                                     });
                                     session = Some(Arc::clone(&state));
@@ -818,9 +1127,13 @@ where
                                         .await;
                                     continue;
                                 }
-                            },
+                            }
                         };
-                        active = Some(spawn_operation_with_handle(state, request.items));
+                        active = Some(spawn_operation_with_handle(
+                            state,
+                            request.items,
+                            request.previous_response_id,
+                        ));
                     }
                     Err(error) => {
                         if socket
@@ -928,5 +1241,51 @@ mod tests {
         assert!(
             matches!(&request.items[0], ResponseItem::Message { content, .. } if matches!(&content[0], ContentItem::InputImage { image_url, .. } if image_url.starts_with("data:image/png")))
         );
+    }
+
+    #[test]
+    fn reasoning_events_include_output_indices() {
+        let reasoning: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_test",
+            "summary": []
+        }))
+        .unwrap();
+        let mut output = vec![reasoning];
+        let delta = native_event(
+            ResponseEvent::ReasoningSummaryDelta {
+                delta: "thinking".to_owned(),
+                summary_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(delta["output_index"], 0);
+        assert_eq!(delta["item_id"], "rs_test");
+
+        let done = native_event(
+            ResponseEvent::ReasoningSummaryDone {
+                item_id: "rs_test".to_owned(),
+                text: "thinking".to_owned(),
+                summary_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(done["output_index"], 0);
+
+        let content_delta = native_event(
+            ResponseEvent::ReasoningContentDelta {
+                delta: "more".to_owned(),
+                content_index: 0,
+            },
+            "resp_test",
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(content_delta["output_index"], 0);
+        assert_eq!(content_delta["item_id"], "rs_test");
     }
 }

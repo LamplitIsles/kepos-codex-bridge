@@ -68,15 +68,16 @@ async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_private_auth_file(&auth_file)?;
     let auth = load_chatgpt_auth(&auth_file)?;
-    let openai = OpenAi::builder(auth)
+    let openai = OpenAi::builder(auth.clone())
         .model(model)
         .websocket_warmup(false)
         .build()?;
-    let bridge = Bridge::new(openai, model, instructions)?;
+    let bridge = Bridge::new(openai, auth, model, instructions)?;
     let (listener, address) = bind_loopback(port).await?;
     eprintln!(
-        "Kepos Codex bridge listening on http://{address}{path}",
-        path = kepos_codex_bridge::ENDPOINT
+        "Kepos Codex bridge listening on http://{address}{responses} and http://{address}{images}",
+        responses = kepos_codex_bridge::ENDPOINT,
+        images = kepos_codex_bridge::IMAGE_ENDPOINT,
     );
     bridge.serve(listener).await?;
     Ok(())

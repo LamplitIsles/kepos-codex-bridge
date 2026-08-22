@@ -7,20 +7,27 @@ execution, and cancellation decisions.
 
 ## Public contract
 
-The only public route is `/codex/responses`.
+The bridge publishes two sibling routes through the same HTTP service:
 
-- `POST` accepts a full streaming native Responses request (it rejects
-  `previous_response_id`) and returns `text/event-stream`; events are
-  `data: {native JSON}\n\n` followed by `data: [DONE]\n\n`.
-- WebSocket upgrade on the same route accepts text `response.create` frames and
-  returns native response event frames. `response.cancel` cancels the active
-  operation.
-- A connection has at most one active response. Input is limited to the pinned
-  Codex subset: text, Luna image input, typed assistant history, function calls,
-  function-call outputs, function tools, and the native fields emitted by the
-  supported Pi/DSH clients.
-- `/v1/responses`, Chat Completions, non-streaming JSON, batch, image
-  generation, and arbitrary future item variants are intentionally absent.
+- `POST /codex/responses` accepts a full streaming native Responses request (it
+  rejects `previous_response_id`) and returns `text/event-stream`; events are
+  `data: {native JSON}\n\n` followed by `data: [DONE]\n\n`. WebSocket upgrade on
+  the same route accepts text `response.create` frames and returns native
+  response event frames. `response.cancel` cancels the active operation. This
+  route retains its existing 4 MiB request limit.
+- `POST /codex/images` accepts JSON `{ "prompt": string, "images"?: string[] }`.
+  A nonblank prompt with no images performs generation; one through five
+  `data:image/...` inputs performs editing. The route returns exactly
+  `{ "image_url": "data:image/png;base64,..." }` and has a 32 MiB encoded
+  request limit. `api_key` may be supplied only as ignored compatibility data;
+  all other unknown fields are rejected.
+
+The image route is a fixed Codex capability boundary, not a general OpenAI
+Images API. It does not accept multipart bodies, remote URLs, file paths,
+provider options, or `/v1` aliases. The bridge selects `gpt-image-2` and the
+fixed Nanocodex-compatible `background`, `quality`, and `size` values. Future
+clients own image loading, history selection, tool schemas, artifacts, and
+rendering.
 
 Incoming API keys are compatibility data only. They are ignored and never
 become upstream credentials. The bridge loads only its local managed ChatGPT
@@ -82,16 +89,17 @@ WSS listener. Set the service allowlist to the peer public keys allowed to use
 this subscription; inheriting the publisher allowlist is acceptable when it is
 already narrow.
 
-The client-side endpoint is the named HTTP service URL produced by Kepos with
-`/codex/responses` appended. The publisher target remains plain local HTTP;
-the peer leg is protected by Kepos Noise. Exact service naming and allowlist
-syntax belongs to the Kepos deployment configuration, for example:
+The client-side endpoints are the named HTTP service URL produced by Kepos
+with `/codex/responses` or `/codex/images` appended. The publisher target
+remains plain local HTTP; the peer leg is protected by Kepos Noise. Exact
+service naming and allowlist syntax belongs to the Kepos deployment
+configuration, for example:
 
 ```text
 service name: codex-bridge
 publisher target: http://127.0.0.1:8787
-path: /codex/responses
-transport: standard Kepos HTTP service (HTTP + WebSocket upgrade)
+paths: /codex/responses and /codex/images
+transport: standard Kepos HTTP service (HTTP + WebSocket upgrade for Responses)
 allowlist: the approved Pi/DSH peer public keys
 ```
 
@@ -152,18 +160,25 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 They cover matching HTTP/SSE and WebSocket framing, the missing `/v1` alias,
-placeholder-key redaction, Luna image typing, one function continuation shape,
-and cancellation/disconnect propagation. Upstream Nanocodex transport and
-Kepos ACL matrices are intentionally not duplicated.
+placeholder-key redaction, Luna image typing, typed function-call output image
+continuation, the image generation/edit contract and boundaries, generic image
+failures, and cancellation/disconnect propagation. Upstream Nanocodex transport
+and Kepos ACL matrices are intentionally not duplicated.
 
-The two non-hermetic acceptance probes are operator/deployment checks, not CI
-or agent tests. Run one combined Pi probe and one combined DSH probe only after
-installing the corresponding client and configuring a test-owned client
-profile. Each probe must cover WebSocket text, a Luna image, one function-call
-round, and cancellation; a missing client or test profile is a failure, not a
-skip. The minimal live OAuth request is an explicitly approved deployment
-validation and must use a dedicated bridge credential file; it is never run by
-CI or this repository's automated tests.
+The non-hermetic Pi acceptance probe is an operator/deployment check, not a CI
+or agent test. Run one combined Pi probe after installing Pi and configuring a
+test-owned client profile. It must cover WebSocket text, a Luna image, one
+function-call round, and cancellation; a missing Pi or test profile is a
+failure, not a skip. DSH remains a documented native consumer of the shared
+endpoint, but this repository does not install, configure, or exercise DSH and
+does not carry a DSH-specific adapter, fixture, or heavy integration harness.
+Validate a later DSH integration separately against an already-running DSH.
+Operator publication verification must use the same named, allowlisted Kepos
+HTTP service for `/codex/images` and a test-owned rejected request to confirm
+that no intermediary imposes a lower-than-32-MiB bound; it must not trigger
+image generation or mutate OAuth state. The minimal live OAuth request is an
+explicitly approved deployment validation and must use a dedicated bridge
+credential file; it is never run by CI or this repository's automated tests.
 
 ## Scope and security boundary
 
