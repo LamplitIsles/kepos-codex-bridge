@@ -8,15 +8,25 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, HeaderName, Response as HttpResponse, StatusCode, Uri, header},
+    extract::ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket},
+    extract::{DefaultBodyLimit, State, WebSocketUpgrade},
+    http::{HeaderMap, HeaderName, HeaderValue, Response as HttpResponse, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::post,
 };
+use futures_util::{SinkExt, StreamExt};
 use nanocodex_oai_api::auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot};
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Error as WebSocketError, Message as TungsteniteMessage, client::IntoClientRequest,
+        protocol::CloseFrame as TungsteniteCloseFrame,
+    },
+};
 
 pub const ENDPOINT: &str = "/codex/responses";
 pub const IMAGE_ENDPOINT: &str = "/codex/images";
@@ -68,7 +78,9 @@ impl Bridge {
         Router::new()
             .route(
                 ENDPOINT,
-                post(http_responses).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
+                post(http_responses)
+                    .get(websocket_responses)
+                    .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
             .route(
                 IMAGE_ENDPOINT,
@@ -130,6 +142,74 @@ impl Bridge {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
         request.send().await.map_err(|_| ())
+    }
+
+    async fn connect_websocket(
+        &self,
+        uri: &Uri,
+        headers: &HeaderMap,
+    ) -> Result<(UpstreamWebSocket, HeaderMap, Option<HeaderValue>), ()> {
+        let endpoint = response_websocket_endpoint(&self.responses_api_base_url, uri);
+        let auth = self.auth.snapshot().await.map_err(|_| ())?;
+        match self
+            .connect_websocket_request(&endpoint, headers, &auth)
+            .await
+        {
+            Ok(connection) => Ok(connection),
+            Err(error)
+                if is_unauthorized_websocket_handshake(&error)
+                    && auth.mode() == OpenAiAuthMode::ChatGpt =>
+            {
+                self.auth
+                    .recover_unauthorized(&auth)
+                    .await
+                    .map_err(|_| ())?;
+                let refreshed = self.auth.snapshot().await.map_err(|_| ())?;
+                self.connect_websocket_request(&endpoint, headers, &refreshed)
+                    .await
+                    .map_err(|_| ())
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    async fn connect_websocket_request(
+        &self,
+        endpoint: &str,
+        headers: &HeaderMap,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<(UpstreamWebSocket, HeaderMap, Option<HeaderValue>), WebSocketError> {
+        let mut request = endpoint.into_client_request()?;
+        request
+            .headers_mut()
+            .extend(forward_websocket_headers(headers));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", auth.bearer()))
+                .expect("managed bearer must be a valid HTTP header"),
+        );
+        if let Some(account_id) = auth.account_id() {
+            request.headers_mut().insert(
+                "ChatGPT-Account-ID",
+                HeaderValue::from_str(account_id)
+                    .expect("managed account ID must be a valid HTTP header"),
+            );
+        }
+        if auth.is_fedramp() {
+            request
+                .headers_mut()
+                .insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+        }
+        let (socket, response) = connect_async(request).await?;
+        let selected_protocol = response
+            .headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .cloned();
+        Ok((
+            socket,
+            safe_websocket_response_headers(response.headers()),
+            selected_protocol,
+        ))
     }
 
     async fn perform_image(&self, operation: ImageOperation) -> Result<String, ()> {
@@ -223,11 +303,43 @@ async fn http_responses(
     }
 }
 
+async fn websocket_responses(
+    State(bridge): State<Arc<Bridge>>,
+    ws: WebSocketUpgrade,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let (upstream, semantic_headers, selected_protocol) =
+        match bridge.connect_websocket(&uri, &headers).await {
+            Ok(connection) => connection,
+            Err(()) => return (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+        };
+    let mut ws = ws;
+    if let Some(protocol) = selected_protocol {
+        ws.set_selected_protocol(protocol);
+    }
+    let mut response = ws.on_upgrade(move |downstream| relay_websockets(downstream, upstream));
+    response.headers_mut().extend(semantic_headers);
+    response
+}
+
 fn response_endpoint(base_url: &str, uri: &Uri) -> String {
     let query = uri
         .query()
         .map_or(String::new(), |query| format!("?{query}"));
     format!("{}/responses{query}", base_url.trim_end_matches('/'))
+}
+
+fn response_websocket_endpoint(base_url: &str, uri: &Uri) -> String {
+    let websocket_base = base_url.strip_prefix("https://").map_or_else(
+        || {
+            base_url
+                .strip_prefix("http://")
+                .map_or_else(|| base_url.to_owned(), |base| format!("ws://{base}"))
+        },
+        |base| format!("wss://{base}"),
+    );
+    response_endpoint(&websocket_base, uri)
 }
 
 fn forward_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -236,6 +348,30 @@ fn forward_request_headers(headers: &HeaderMap) -> HeaderMap {
 
 fn safe_response_headers(headers: &HeaderMap) -> HeaderMap {
     forward_headers(headers, HeaderDirection::Response)
+}
+
+fn forward_websocket_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = forward_request_headers(headers);
+    remove_websocket_framing_headers(&mut forwarded);
+    forwarded
+}
+
+fn safe_websocket_response_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = safe_response_headers(headers);
+    remove_websocket_framing_headers(&mut forwarded);
+    forwarded.remove(header::SEC_WEBSOCKET_PROTOCOL);
+    forwarded
+}
+
+fn remove_websocket_framing_headers(headers: &mut HeaderMap) {
+    for name in [
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "sec-websocket-key",
+        "sec-websocket-version",
+    ] {
+        headers.remove(name);
+    }
 }
 
 enum HeaderDirection {
@@ -306,6 +442,75 @@ fn relay_response(upstream: reqwest::Response) -> Response {
     response
         .body(Body::from_stream(upstream.bytes_stream()))
         .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
+}
+
+type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+fn is_unauthorized_websocket_handshake(error: &WebSocketError) -> bool {
+    matches!(error, WebSocketError::Http(response) if response.status() == StatusCode::UNAUTHORIZED)
+}
+
+async fn relay_websockets(downstream: WebSocket, upstream: UpstreamWebSocket) {
+    let (mut downstream_sink, mut downstream_stream) = downstream.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+    loop {
+        tokio::select! {
+            message = downstream_stream.next() => match message {
+                Some(Ok(message)) => {
+                    let close = matches!(message, AxumMessage::Close(_));
+                    if upstream_sink.send(to_upstream_message(message)).await.is_err() || close {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            },
+            message = upstream_stream.next() => match message {
+                Some(Ok(message)) => {
+                    let close = matches!(message, TungsteniteMessage::Close(_));
+                    if let Some(message) = to_downstream_message(message)
+                        && (downstream_sink.send(message).await.is_err() || close)
+                    {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => {
+                    let _ = downstream_sink.send(AxumMessage::Close(None)).await;
+                    break;
+                }
+            },
+        }
+    }
+}
+
+fn to_upstream_message(message: AxumMessage) -> TungsteniteMessage {
+    match message {
+        AxumMessage::Text(text) => TungsteniteMessage::Text(text.to_string().into()),
+        AxumMessage::Binary(bytes) => TungsteniteMessage::Binary(bytes),
+        AxumMessage::Ping(bytes) => TungsteniteMessage::Ping(bytes),
+        AxumMessage::Pong(bytes) => TungsteniteMessage::Pong(bytes),
+        AxumMessage::Close(frame) => {
+            TungsteniteMessage::Close(frame.map(|frame| TungsteniteCloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            }))
+        }
+    }
+}
+
+fn to_downstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
+    match message {
+        TungsteniteMessage::Text(text) => Some(AxumMessage::Text(text.to_string().into())),
+        TungsteniteMessage::Binary(bytes) => Some(AxumMessage::Binary(bytes)),
+        TungsteniteMessage::Ping(_)
+        | TungsteniteMessage::Pong(_)
+        | TungsteniteMessage::Frame(_) => None,
+        TungsteniteMessage::Close(frame) => {
+            Some(AxumMessage::Close(frame.map(|frame| AxumCloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            })))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

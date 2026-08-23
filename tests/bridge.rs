@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use futures_util::Stream;
+use futures_util::{SinkExt, Stream, StreamExt};
 use kepos_codex_bridge::{Bridge, ENDPOINT, IMAGE_ENDPOINT};
 use nanocodex_oai_api::{
     Model, OpenAi,
@@ -28,8 +28,19 @@ use nanocodex_oai_api::{
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{Mutex, oneshot},
+    time::timeout,
+};
+use tokio_tungstenite::{
+    accept_hdr_async, connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        handshake::server::{Request as WebSocketRequest, Response as WebSocketResponse},
+        protocol::CloseFrame,
+    },
 };
 
 struct TestManagedAuth {
@@ -364,6 +375,271 @@ async fn pinned_nanocodex_http_client_creates_then_compacts_through_relay() {
     assert!(String::from_utf8_lossy(&calls[1].body).contains("compaction_trigger"));
     bridge_server.abort();
     origin_server.abort();
+}
+
+async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            return String::from_utf8(bytes).expect("HTTP header text");
+        }
+        assert_ne!(
+            stream.read_buf(&mut bytes).await.expect("read HTTP header"),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn websocket_retries_managed_auth_and_relays_semantic_metadata_and_payloads() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("origin listener");
+    let origin_address = listener.local_addr().expect("origin address");
+    let origin_server = tokio::spawn(async move {
+        let (mut rejected, _) = listener.accept().await.expect("stale connection");
+        let stale_headers = read_http_head(&mut rejected).await.to_ascii_lowercase();
+        assert!(stale_headers.contains("authorization: bearer managed-stale"));
+        assert!(!stale_headers.contains("peer-secret"));
+        assert!(!stale_headers.contains("peer-cookie"));
+        rejected
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .expect("401 response");
+
+        let (stream, _) = listener.accept().await.expect("fresh connection");
+        let mut socket = accept_hdr_async(
+            stream,
+            |request: &WebSocketRequest, mut response: WebSocketResponse| {
+                assert_eq!(request.uri().query(), Some("client-query=opaque"));
+                for (name, value) in [
+                    ("x-openai-internal-codex-responses-lite", "true"),
+                    ("openai-beta", "responses_websockets=2026-02-06"),
+                    ("prompt-cache-key", "cache-client"),
+                    ("session-id", "session-client"),
+                    ("thread-id", "thread-client"),
+                    ("x-client-request-id", "request-client"),
+                    ("x-codex-turn-state", "turn-client"),
+                ] {
+                    assert_eq!(request.headers()[name], value);
+                }
+                assert_eq!(request.headers()["authorization"], "Bearer managed-fresh");
+                assert_eq!(request.headers()["sec-websocket-protocol"], "codex-test");
+                assert_eq!(request.headers()["chatgpt-account-id"], "managed-account");
+                assert_eq!(request.headers()["x-openai-fedramp"], "true");
+                for name in ["x-api-key", "cookie"] {
+                    assert!(!request.headers().contains_key(name));
+                }
+                response.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    "codex-test".parse().expect("protocol header"),
+                );
+                response.headers_mut().insert(
+                    "x-codex-turn-state",
+                    "upstream-turn".parse().expect("turn header"),
+                );
+                response.headers_mut().insert(
+                    "openai-model",
+                    "upstream-model".parse().expect("model header"),
+                );
+                response.headers_mut().insert(
+                    "x-reasoning-included",
+                    "true".parse().expect("reasoning header"),
+                );
+                response.headers_mut().insert(
+                    "set-cookie",
+                    "upstream-secret=never-forward"
+                        .parse()
+                        .expect("cookie header"),
+                );
+                Ok(response)
+            },
+        )
+        .await
+        .expect("upstream WebSocket handshake");
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("text frame")
+                .expect("text message"),
+            Message::Text(r#"{"type":"response.create","previous_response_id":"response-client","prompt_cache_key":"cache-client","client_metadata":{"opaque":"value"}}"#.into())
+        );
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("binary frame")
+                .expect("binary message"),
+            Message::Binary(vec![0, 255, 42].into())
+        );
+        socket
+            .send(Message::Text("upstream text payload".into()))
+            .await
+            .expect("upstream text");
+        socket
+            .send(Message::Binary(vec![9, 8, 7].into()))
+            .await
+            .expect("upstream binary");
+        socket
+            .send(Message::Ping(vec![1, 2, 3].into()))
+            .await
+            .expect("upstream ping");
+        let pong = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("pong deadline")
+            .expect("pong frame")
+            .expect("pong message");
+        assert_eq!(pong, Message::Pong(vec![1, 2, 3].into()));
+        let close = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("close deadline")
+            .expect("close frame")
+            .expect("close message");
+        assert!(
+            matches!(close, Message::Close(Some(frame)) if u16::from(frame.code) == 4001 && frame.reason == "client close")
+        );
+    });
+
+    let (url, bridge_server) =
+        start_bridge(managed_auth(), format!("http://{origin_address}"), None).await;
+    let websocket_url = format!("{}?client-query=opaque", url.replacen("http", "ws", 1));
+    let mut request = websocket_url.into_client_request().expect("client request");
+    for (name, value) in [
+        ("x-openai-internal-codex-responses-lite", "true"),
+        ("openai-beta", "responses_websockets=2026-02-06"),
+        ("prompt-cache-key", "cache-client"),
+        ("session-id", "session-client"),
+        ("thread-id", "thread-client"),
+        ("x-client-request-id", "request-client"),
+        ("x-codex-turn-state", "turn-client"),
+        ("authorization", "Bearer peer-secret"),
+        ("x-api-key", "peer-api-key"),
+        ("cookie", "peer-cookie=secret"),
+        ("sec-websocket-protocol", "codex-test"),
+    ] {
+        request
+            .headers_mut()
+            .insert(name, value.parse().expect("client header"));
+    }
+    let (mut socket, response) = connect_async(request)
+        .await
+        .expect("bridge WebSocket handshake");
+    assert_eq!(response.headers()["sec-websocket-protocol"], "codex-test");
+    assert_eq!(response.headers()["x-codex-turn-state"], "upstream-turn");
+    assert_eq!(response.headers()["openai-model"], "upstream-model");
+    assert_eq!(response.headers()["x-reasoning-included"], "true");
+    assert!(!response.headers().contains_key("set-cookie"));
+    socket
+        .send(Message::Text(r#"{"type":"response.create","previous_response_id":"response-client","prompt_cache_key":"cache-client","client_metadata":{"opaque":"value"}}"#.into()))
+        .await
+        .expect("client text");
+    socket
+        .send(Message::Binary(vec![0, 255, 42].into()))
+        .await
+        .expect("client binary");
+    assert_eq!(
+        socket
+            .next()
+            .await
+            .expect("upstream text")
+            .expect("text message"),
+        Message::Text("upstream text payload".into())
+    );
+    assert_eq!(
+        socket
+            .next()
+            .await
+            .expect("upstream binary")
+            .expect("binary message"),
+        Message::Binary(vec![9, 8, 7].into())
+    );
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code: 4001.into(),
+            reason: "client close".into(),
+        })))
+        .await
+        .expect("client close");
+    timeout(Duration::from_secs(5), origin_server)
+        .await
+        .expect("origin completion")
+        .expect("origin result");
+    bridge_server.abort();
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn pinned_nanocodex_websocket_client_creates_then_compacts_through_relay() {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("origin listener");
+    let origin_address = listener.local_addr().expect("origin address");
+    let origin_server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("WebSocket connection");
+        let mut socket = accept_hdr_async(
+            stream,
+            |request: &WebSocketRequest, response: WebSocketResponse| {
+                assert_eq!(request.headers()["authorization"], "Bearer managed-stale");
+                assert_eq!(request.headers()["chatgpt-account-id"], "managed-account");
+                assert_eq!(request.headers()["x-openai-fedramp"], "true");
+                assert!(!request.headers().contains_key("x-api-key"));
+                Ok(response)
+            },
+        )
+        .await
+        .expect("upstream WebSocket handshake");
+        let create = socket
+            .next()
+            .await
+            .expect("create frame")
+            .expect("create message")
+            .into_text()
+            .expect("create text");
+        assert!(create.contains("first request"));
+        socket.send(Message::Text(json!({"type":"response.completed","response":{"id":"create-response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"relay answer"}]}],"usage":null}}).to_string().into())).await.expect("create response");
+        let compact = socket
+            .next()
+            .await
+            .expect("compact frame")
+            .expect("compact message")
+            .into_text()
+            .expect("compact text");
+        assert!(compact.contains("compaction_trigger"));
+        socket.send(Message::Text(json!({"type":"response.output_item.done","item":{"id":"cmp-upstream","type":"compaction","encrypted_content":"opaque-output"}}).to_string().into())).await.expect("compaction item");
+        socket.send(Message::Text(json!({"type":"response.completed","response":{"id":"compact-response","status":"completed","output":[],"usage":null}}).to_string().into())).await.expect("compact response");
+    });
+
+    let (url, bridge_server) =
+        start_bridge(managed_auth(), format!("http://{origin_address}"), None).await;
+    let openai = OpenAi::builder("nonsecret-test-key")
+        .model(Model::Luna)
+        .transport(ResponsesTransport::WebSocket)
+        .websocket_warmup(false)
+        .websocket_url(url.replacen("http", "ws", 1))
+        .build()
+        .expect("Nanocodex WebSocket client");
+    let mut session = openai
+        .instructions("test instruction")
+        .build()
+        .expect("Nanocodex session");
+    let mut turn = session.turn();
+    assert_eq!(
+        turn.create("first request")
+            .await
+            .expect("create response")
+            .output_text(),
+        "relay answer"
+    );
+    turn.compact().await.expect("compact response");
+    timeout(Duration::from_secs(5), origin_server)
+        .await
+        .expect("origin completion")
+        .expect("origin result");
+    bridge_server.abort();
 }
 
 #[derive(Clone)]
