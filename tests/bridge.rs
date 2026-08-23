@@ -1,34 +1,48 @@
 use std::{
+    convert::Infallible,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use axum::{
+    body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::post,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::Stream;
 use kepos_codex_bridge::{Bridge, ENDPOINT, IMAGE_ENDPOINT};
 use nanocodex_oai_api::{
-    Model, OpenAi, ResponseError, ResponseEvent,
+    Model, OpenAi,
     auth::{
         OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
         OpenAiAuthSource,
     },
-    responses::{ContentItem, MessageRole, ResponseItem},
-    tower::{GenerationOutput, ResponsePipelineStats, ResponsesOutput, ResponsesServiceResponse},
+    transport::ResponsesTransport,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tower::service_fn;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, oneshot},
+};
 
-struct TestManagedAuth;
+struct TestManagedAuth {
+    recovered: AtomicBool,
+}
+
+impl TestManagedAuth {
+    fn new() -> Self {
+        Self {
+            recovered: AtomicBool::new(false),
+        }
+    }
+}
 
 impl OpenAiAuthSource for TestManagedAuth {
     fn validate(&self) -> Result<(), OpenAiAuthError> {
@@ -36,10 +50,15 @@ impl OpenAiAuthSource for TestManagedAuth {
     }
 
     fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
-        Box::pin(async {
+        let bearer = if self.recovered.load(Ordering::SeqCst) {
+            "managed-fresh"
+        } else {
+            "managed-stale"
+        };
+        Box::pin(async move {
             Ok(OpenAiAuthSnapshot::new(
                 OpenAiAuthMode::ChatGpt,
-                "managed-bearer",
+                bearer,
                 Some("managed-account"),
                 true,
                 0,
@@ -51,39 +70,328 @@ impl OpenAiAuthSource for TestManagedAuth {
         &self,
         _rejected: &OpenAiAuthSnapshot,
     ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
-        Box::pin(async { Err(OpenAiAuthError::LoginRequired("test auth".into())) })
+        self.recovered.store(true, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
     }
 }
 
+fn managed_auth() -> OpenAiAuth {
+    OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth::new()))
+}
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
 #[derive(Clone)]
-struct ImageUpstreamState {
+struct RecordingOrigin {
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    unauthorized_stale: bool,
+    response_status: StatusCode,
+}
+
+async fn recording_responses(
+    State(state): State<RecordingOrigin>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.requests.lock().await.push(RecordedRequest {
+        uri,
+        headers: headers.clone(),
+        body: body.clone(),
+    });
+    if state.unauthorized_stale
+        && headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer managed-stale")
+    {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("set-cookie", "upstream-secret=never-forward")
+            .body(Body::from("unauthorized"))
+            .expect("401 response");
+    }
+    let compaction = String::from_utf8_lossy(&body).contains("compaction_trigger");
+    let completed = if compaction {
+        json!({"type":"response.completed","response":{"id":"compact-response","status":"completed","output":[{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}],"usage":null}})
+    } else {
+        json!({"type":"response.completed","response":{"id":"normal-response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"relay answer"}]}],"usage":null}})
+    };
+    let body = format!("event: opaque\ndata: {}\n\ndata: [DONE]\n\n", completed);
+    Response::builder()
+        .status(state.response_status)
+        .header("content-type", "text/event-stream")
+        .header("x-codex-turn-state", "client-owned-turn")
+        .header("x-reasoning-included", "true")
+        .header("set-cookie", "upstream-secret=never-forward")
+        .body(Body::from(body))
+        .expect("SSE response")
+}
+
+async fn start_recording_origin(
+    unauthorized_stale: bool,
+    response_status: StatusCode,
+) -> (
+    String,
+    Arc<Mutex<Vec<RecordedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = RecordingOrigin {
+        requests: requests.clone(),
+        unauthorized_stale,
+        response_status,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("origin listener");
+    let address = listener.local_addr().expect("origin address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/responses", post(recording_responses))
+                .with_state(state),
+        )
+        .await
+        .expect("recording origin");
+    });
+    (format!("http://{address}"), requests, task)
+}
+
+async fn start_bridge(
+    auth: OpenAiAuth,
+    responses_base: String,
+    image_base: Option<String>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let bridge = Bridge::new(auth).with_responses_api_base_url(responses_base);
+    let bridge = if let Some(image_base) = image_base {
+        bridge.with_image_api_base_url(image_base)
+    } else {
+        bridge
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bridge listener");
+    let address = listener.local_addr().expect("bridge address");
+    let task = tokio::spawn(async move {
+        axum::serve(listener, bridge.router())
+            .await
+            .expect("bridge server");
+    });
+    (format!("http://{address}{ENDPOINT}"), task)
+}
+
+#[tokio::test]
+async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
+    let (origin, requests, origin_server) =
+        start_recording_origin(false, StatusCode::CREATED).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let opaque = br#"{"model":"arbitrary-client-model","input":[{"role":"developer","content":"keep all fields"}],"prompt_cache_key":"cache-client","previous_response_id":"response-client","additional_tools":[{"type":"computer"}],"client_metadata":{"opaque":"value"}}"#;
+    let compressed = zstd::stream::encode_all(&opaque[..], 3).expect("compress request");
+    let response = Client::new()
+        .post(format!("{url}?client-query=opaque"))
+        .header("content-encoding", "zstd")
+        .header("content-type", "application/json")
+        .header("x-openai-internal-codex-responses-lite", "true")
+        .header("x-codex-beta-features", "remote_compaction_v2")
+        .header("session-id", "session-client")
+        .header("thread-id", "thread-client")
+        .header("x-client-request-id", "request-client")
+        .header("x-codex-turn-state", "turn-client")
+        .header("authorization", "Bearer peer-secret")
+        .header("x-api-key", "peer-api-key")
+        .header("cookie", "peer-cookie=secret")
+        .header("chatgpt-account-id", "peer-account")
+        .header("x-openai-fedramp", "false")
+        .body(compressed.clone())
+        .send()
+        .await
+        .expect("relay response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers()["x-codex-turn-state"],
+        "client-owned-turn"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    let sse = response.bytes().await.expect("SSE bytes");
+    assert!(sse.starts_with(b"event: opaque\ndata: "));
+    assert!(sse.ends_with(b"data: [DONE]\n\n"));
+
+    let recorded = requests.lock().await.pop().expect("origin request");
+    assert_eq!(recorded.uri.query(), Some("client-query=opaque"));
+    assert_eq!(recorded.body, compressed);
+    for (name, value) in [
+        ("content-encoding", "zstd"),
+        ("x-openai-internal-codex-responses-lite", "true"),
+        ("x-codex-beta-features", "remote_compaction_v2"),
+        ("session-id", "session-client"),
+        ("thread-id", "thread-client"),
+        ("x-client-request-id", "request-client"),
+        ("x-codex-turn-state", "turn-client"),
+    ] {
+        assert_eq!(recorded.headers[name], value);
+    }
+    assert_eq!(recorded.headers["authorization"], "Bearer managed-stale");
+    assert_eq!(recorded.headers["chatgpt-account-id"], "managed-account");
+    assert_eq!(recorded.headers["x-openai-fedramp"], "true");
+    for name in ["x-api-key", "cookie"] {
+        assert!(!recorded.headers.contains_key(name));
+    }
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn retries_a_401_once_with_refreshed_managed_identity() {
+    let (origin, requests, origin_server) = start_recording_origin(true, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(&url)
+        .header("authorization", "Bearer peer-secret")
+        .header("cookie", "peer-cookie=secret")
+        .body("complete Lite request with remote_compaction_v2")
+        .send()
+        .await
+        .expect("relay response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key("set-cookie"));
+    let sse =
+        String::from_utf8(response.bytes().await.expect("SSE bytes").to_vec()).expect("SSE text");
+    assert!(!sse.contains("peer-secret"));
+    assert!(!sse.contains("managed-"));
+    let calls = requests.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].headers["authorization"], "Bearer managed-stale");
+    assert_eq!(calls[1].headers["authorization"], "Bearer managed-fresh");
+    for call in calls.iter() {
+        assert!(!call.headers.contains_key("cookie"));
+    }
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+struct PendingStream(Option<oneshot::Sender<()>>);
+impl Stream for PendingStream {
+    type Item = Result<Bytes, Infallible>;
+    fn poll_next(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Pending
+    }
+}
+impl Drop for PendingStream {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+async fn pending_response(
+    State(sender): State<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
+) -> Response {
+    let sender = sender.lock().await.take().expect("one request");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(PendingStream(Some(sender))))
+        .expect("pending response")
+}
+
+#[tokio::test]
+async fn downstream_disconnect_drops_the_upstream_stream() {
+    let (sender, receiver) = oneshot::channel();
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("origin listener");
+    let address = listener.local_addr().expect("origin address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/responses", post(pending_response))
+                .with_state(Arc::new(Mutex::new(Some(sender)))),
+        )
+        .await
+        .expect("origin server");
+    });
+    let (url, bridge_server) =
+        start_bridge(managed_auth(), format!("http://{address}"), None).await;
+    let response = Client::new()
+        .post(url)
+        .body("opaque request")
+        .send()
+        .await
+        .expect("response headers");
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(2), receiver)
+        .await
+        .expect("upstream stream release")
+        .expect("drop signal");
+    bridge_server.abort();
+    task.abort();
+}
+
+#[tokio::test]
+async fn pinned_nanocodex_http_client_creates_then_compacts_through_relay() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let base = url.trim_end_matches(ENDPOINT).to_owned() + "/codex";
+    let openai = OpenAi::builder("nonsecret-test-key")
+        .model(Model::Luna)
+        .transport(ResponsesTransport::Https)
+        .api_base_url(base)
+        .build()
+        .expect("Nanocodex HTTP client");
+    let mut session = openai
+        .instructions("test instruction")
+        .build()
+        .expect("Nanocodex session");
+    let mut turn = session.turn();
+    assert_eq!(
+        turn.create("first request")
+            .await
+            .expect("create response")
+            .output_text(),
+        "relay answer"
+    );
+    turn.compact().await.expect("compact response");
+    let calls = requests.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert!(String::from_utf8_lossy(&calls[1].body).contains("compaction_trigger"));
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[derive(Clone)]
+struct ImageOrigin {
     calls: Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
     fail: bool,
 }
 
-async fn image_upstream(
-    State(state): State<ImageUpstreamState>,
-    uri: axum::http::Uri,
+async fn image_response(
+    State(origin): State<ImageOrigin>,
+    uri: Uri,
     headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let value = serde_json::from_slice(&body).expect("image upstream JSON");
-    state
+    body: Bytes,
+) -> Response {
+    let body = serde_json::from_slice(&body).expect("image JSON");
+    origin
         .calls
         .lock()
         .await
-        .push((uri.path().to_owned(), headers, value));
-    if state.fail {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        .push((uri.path().to_owned(), headers, body));
+    if origin.fail {
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    } else {
+        axum::Json(json!({"data":[{"b64_json":"AAAA"}]})).into_response()
     }
-    axum::Json(json!({
-        "created": 1,
-        "data": [{"b64_json": "AAAA"}]
-    }))
-    .into_response()
 }
 
-async fn start_image_upstream(
+async fn start_image_origin(
     fail: bool,
 ) -> (
     String,
@@ -91,424 +399,90 @@ async fn start_image_upstream(
     tokio::task::JoinHandle<()>,
 ) {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = ImageUpstreamState {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("image listener");
+    let address = listener.local_addr().expect("image address");
+    let origin = ImageOrigin {
         calls: calls.clone(),
         fail,
     };
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("image upstream listener");
-    let address = listener.local_addr().expect("image upstream address");
-    let task = tokio::spawn(async move {
+    let origin_server = tokio::spawn(async move {
         axum::serve(
             listener,
             axum::Router::new()
-                .route("/images/generations", axum::routing::post(image_upstream))
-                .route("/images/edits", axum::routing::post(image_upstream))
-                .with_state(state),
+                .route("/images/generations", post(image_response))
+                .route("/images/edits", post(image_response))
+                .with_state(origin),
         )
         .await
-        .expect("image upstream server");
+        .expect("image origin");
     });
-    (format!("http://{address}"), calls, task)
-}
-
-#[derive(Clone)]
-struct CompactUpstreamState {
-    request: Arc<Mutex<Option<(HeaderMap, Value)>>>,
-    response: &'static str,
-}
-
-async fn compact_upstream(
-    State(state): State<CompactUpstreamState>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let value = serde_json::from_slice(&body).expect("compaction upstream JSON");
-    *state.request.lock().await = Some((headers, value));
-    axum::response::Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(axum::body::Body::from(state.response))
-        .expect("compaction SSE response")
-}
-
-async fn start_compact_upstream() -> (
-    String,
-    Arc<Mutex<Option<(HeaderMap, Value)>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let request = Arc::new(Mutex::new(None));
-    let state = CompactUpstreamState {
-        request: request.clone(),
-        response: r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}}
-
-data: {"type":"response.completed","response":{"id":"resp-upstream","object":"response","status":"completed","output":[{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}],"usage":null,"end_turn":true}}
-
-data: [DONE]
-
-"#,
-    };
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("compaction upstream listener");
-    let address = listener.local_addr().expect("compaction upstream address");
-    let task = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            axum::Router::new()
-                .route("/responses", axum::routing::post(compact_upstream))
-                .with_state(state),
-        )
-        .await
-        .expect("compaction upstream server");
-    });
-    (format!("http://{address}"), request, task)
-}
-
-async fn start_bridge(
-    calls: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicBool>,
-    wait: bool,
-) -> (String, tokio::task::JoinHandle<()>) {
-    start_bridge_mode(calls, cancelled, wait, false, false, None, None, None).await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn start_bridge_mode(
-    calls: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicBool>,
-    wait: bool,
-    function_round: bool,
-    multi_output: bool,
-    image_seen: Option<Arc<AtomicBool>>,
-    output_seen: Option<Arc<AtomicBool>>,
-    output_image_seen: Option<Arc<AtomicBool>>,
-) -> (String, tokio::task::JoinHandle<()>) {
-    start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        wait,
-        function_round,
-        multi_output,
-        image_seen,
-        output_seen,
-        output_image_seen,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn start_bridge_mode_with_image(
-    calls: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicBool>,
-    wait: bool,
-    function_round: bool,
-    multi_output: bool,
-    image_seen: Option<Arc<AtomicBool>>,
-    output_seen: Option<Arc<AtomicBool>>,
-    output_image_seen: Option<Arc<AtomicBool>>,
-    image_auth: Option<OpenAiAuth>,
-    image_api_base_url: Option<String>,
-    responses_api_base_url: Option<String>,
-    request_inputs: Option<Arc<Mutex<Vec<Vec<ResponseItem>>>>>,
-) -> (String, tokio::task::JoinHandle<()>) {
-    let image_auth = image_auth.unwrap_or_else(|| OpenAiAuth::api_key("dummy-client-key"));
-    let openai = OpenAi::builder(image_auth.clone())
-        .model(Model::Luna)
-        .service(move || {
-            let calls = Arc::clone(&calls);
-            let cancelled = Arc::clone(&cancelled);
-            let image_seen = image_seen.clone();
-            let output_seen = output_seen.clone();
-            let output_image_seen = output_image_seen.clone();
-            let request_inputs = request_inputs.clone();
-            service_fn(move |attempt: nanocodex_oai_api::tower::ResponsesAttempt| {
-                let calls = Arc::clone(&calls);
-                let cancelled = Arc::clone(&cancelled);
-                let image_seen = image_seen.clone();
-                let output_seen = output_seen.clone();
-                let output_image_seen = output_image_seen.clone();
-                let request_inputs = request_inputs.clone();
-                async move {
-                    let call_number = calls.fetch_add(1, Ordering::SeqCst);
-                    let inputs = attempt.input_items().cloned().collect::<Vec<_>>();
-                    if let Some(request_inputs) = request_inputs {
-                        request_inputs.lock().await.push(inputs.clone());
-                    }
-                    let encoded_inputs = serde_json::to_string(&inputs).expect("test input JSON");
-                    if encoded_inputs.contains("data:image/png") {
-                        if let Some(seen) = image_seen.as_ref() {
-                            seen.store(true, Ordering::SeqCst);
-                        }
-                    }
-                    if encoded_inputs.contains("function_call_output") {
-                        if let Some(seen) = output_seen.as_ref() {
-                            seen.store(true, Ordering::SeqCst);
-                        }
-                        if encoded_inputs.contains("data:image/png")
-                            && let Some(seen) = output_image_seen.as_ref()
-                        {
-                            seen.store(true, Ordering::SeqCst);
-                        }
-                    }
-                    attempt.emit(ResponseEvent::Created).await;
-                    if wait {
-                        struct CancelGuard(Arc<AtomicBool>);
-                        impl Drop for CancelGuard {
-                            fn drop(&mut self) {
-                                self.0.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        let _guard = CancelGuard(cancelled);
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                    let items = if encoded_inputs.contains("\"type\":\"compaction\"") {
-                        vec![(
-                            serde_json::from_value(json!({
-                                "type": "compaction",
-                                "id": "cmp-test",
-                                "encrypted_content": "opaque-output"
-                            }))
-                            .expect("compaction output item"),
-                            "",
-                        )]
-                    } else if multi_output {
-                        vec![
-                            (
-                                ResponseItem::message(
-                                    MessageRole::Assistant,
-                                    [ContentItem::output_text("first output")],
-                                ),
-                                "first output",
-                            ),
-                            (
-                                ResponseItem::message(
-                                    MessageRole::Assistant,
-                                    [ContentItem::output_text("second output")],
-                                ),
-                                "second output",
-                            ),
-                        ]
-                    } else {
-                        vec![(
-                            if function_round && call_number == 0 {
-                                ResponseItem::FunctionCall {
-                                    id: Some("fc-test".into()),
-                                    name: "lookup".into(),
-                                    namespace: None,
-                                    arguments: r#"{"city":"Paris"}"#.into(),
-                                    encrypted_function_args: None,
-                                    call_id: "call-test".into(),
-                                    caller: None,
-                                    status: None,
-                                    created_by: None,
-                                    internal_chat_message_metadata_passthrough: None,
-                                }
-                            } else {
-                                ResponseItem::message(
-                                    MessageRole::Assistant,
-                                    [ContentItem::output_text("bridge text")],
-                                )
-                            },
-                            "bridge text",
-                        )]
-                    };
-                    for (item, delta) in &items {
-                        attempt
-                            .emit(ResponseEvent::OutputItemAdded(item.clone()))
-                            .await;
-                        if !delta.is_empty() {
-                            attempt
-                                .emit(ResponseEvent::OutputTextDelta((*delta).to_owned()))
-                                .await;
-                        }
-                        attempt
-                            .emit(ResponseEvent::OutputItemDone(item.clone()))
-                            .await;
-                    }
-                    Ok::<_, ResponseError>(ResponsesServiceResponse::new(
-                        ResponsesOutput::Generation(GenerationOutput {
-                            id: "upstream-response".to_owned(),
-                            status: "completed".to_owned(),
-                            end_turn: Some(true),
-                            final_message: Some("bridge text".to_owned()),
-                            output_items: items.into_iter().map(|(item, _)| item).collect(),
-                            code_calls: Vec::new(),
-                            usage: None,
-                            time_to_first_event_ns: 0,
-                            time_to_first_output_ns: Some(0),
-                            pipeline_stats: ResponsePipelineStats::default(),
-                        }),
-                    ))
-                }
-            })
-        })
-        .build()
-        .expect("test client configuration");
-    let bridge =
-        Bridge::new(openai, image_auth, Model::Luna, "test instruction").expect("bridge config");
-    let bridge = if let Some(base_url) = image_api_base_url {
-        bridge.with_image_api_base_url(base_url)
-    } else {
-        bridge
-    };
-    let bridge = if let Some(base_url) = responses_api_base_url {
-        bridge.with_responses_api_base_url(base_url)
-    } else {
-        bridge
-    };
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("test listener");
-    let address = listener.local_addr().expect("test address");
-    let task = tokio::spawn(async move {
-        axum::serve(listener, bridge.router())
-            .await
-            .expect("test server");
-    });
-    (format!("http://{address}{ENDPOINT}"), task)
-}
-
-fn request() -> Value {
-    json!({
-        "model": "gpt-5.6-luna",
-        "input": "hello",
-        "stream": true,
-        "api_key": "dummy-key-must-not-echo"
-    })
-}
-
-async fn wait_until_cancelled(cancelled: &AtomicBool) {
-    for _ in 0..50 {
-        if cancelled.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(cancelled.load(Ordering::SeqCst));
+    (format!("http://{address}"), calls, origin_server)
 }
 
 #[tokio::test]
-async fn image_generation_uses_fixed_contract_and_managed_header_shape() {
-    let (upstream, image_calls, upstream_server) = start_image_upstream(false).await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (responses_url, bridge_server) = start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
-        Some(upstream),
-        None,
-        None,
+async fn fixed_image_endpoint_remains_unchanged() {
+    let (image_base, calls, origin_server) = start_image_origin(false).await;
+    let (url, bridge_server) = start_bridge(
+        managed_auth(),
+        "http://127.0.0.1:1".to_owned(),
+        Some(image_base),
     )
     .await;
     let response = Client::new()
-        .post(responses_url.replace(ENDPOINT, IMAGE_ENDPOINT))
-        .header("content-type", "application/json")
-        .json(&json!({
-            "prompt": "draw a secret sentinel",
-            "api_key": "peer-compatibility-key"
-        }))
+        .post(url.replace(ENDPOINT, IMAGE_ENDPOINT))
+        .json(&json!({"prompt":"draw","api_key":"peer-secret"}))
         .send()
         .await
-        .expect("image response");
-    assert_eq!(response.status(), 200);
+        .expect("image relay");
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.json::<Value>().await.expect("image JSON"),
-        json!({"image_url": "data:image/png;base64,AAAA"})
+        json!({"image_url":"data:image/png;base64,AAAA"})
     );
-    let calls = image_calls.lock().await;
+    let calls = calls.lock().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "/images/generations");
-    assert_eq!(
-        calls[0].2,
-        json!({
-            "prompt": "draw a secret sentinel",
-            "background": "auto",
-            "model": "gpt-image-2",
-            "quality": "auto",
-            "size": "auto"
-        })
-    );
-    assert_eq!(calls[0].1["authorization"], "Bearer managed-bearer");
+    assert!(calls[0].2.get("api_key").is_none());
+    assert_eq!(calls[0].1["authorization"], "Bearer managed-stale");
     assert_eq!(calls[0].1["chatgpt-account-id"], "managed-account");
-    assert_eq!(calls[0].1["x-openai-fedramp"], "true");
-    assert!(
-        !serde_json::to_string(&calls[0].2)
-            .expect("upstream body JSON")
-            .contains("peer-compatibility-key")
-    );
     bridge_server.abort();
-    upstream_server.abort();
+    origin_server.abort();
 }
 
 #[tokio::test]
-async fn image_edit_accepts_five_data_images_and_rejects_invalid_inputs() {
-    let (upstream, image_calls, upstream_server) = start_image_upstream(false).await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (responses_url, bridge_server) = start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        Some(upstream),
-        None,
-        None,
+async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
+    let (image_base, calls, origin_server) = start_image_origin(false).await;
+    let (url, bridge_server) = start_bridge(
+        managed_auth(),
+        "http://127.0.0.1:1".to_owned(),
+        Some(image_base),
     )
     .await;
-    let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
+    let image_url = url.replace(ENDPOINT, IMAGE_ENDPOINT);
     let images = (0..5)
         .map(|index| format!("data:image/png;base64,IMG{index}"))
         .collect::<Vec<_>>();
     let response = Client::new()
         .post(&image_url)
-        .json(&json!({"prompt": "edit these", "images": images}))
+        .json(&json!({"prompt":"edit","images":images}))
         .send()
         .await
-        .expect("image edit response");
-    assert_eq!(response.status(), 200);
-    {
-        let upstream_calls = image_calls.lock().await;
-        let call = &upstream_calls[0];
-        assert_eq!(call.0, "/images/edits");
-        assert_eq!(
-            call.2["images"].as_array().expect("wrapped images").len(),
-            5
-        );
-        assert_eq!(
-            call.2["images"][0]["image_url"],
-            "data:image/png;base64,IMG0"
-        );
-    }
-
-    for request in [
-        json!({"prompt": "six", "images": ["data:image/png;base64,A", "data:image/png;base64,B", "data:image/png;base64,C", "data:image/png;base64,D", "data:image/png;base64,E", "data:image/png;base64,F"]}),
-        json!({"prompt": "remote", "images": ["https://example.test/image.png"]}),
+        .expect("image edit");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.lock().await[0].0, "/images/edits");
+    for invalid in [
+        json!({"prompt":"six","images":["data:image/png;base64,A","data:image/png;base64,B","data:image/png;base64,C","data:image/png;base64,D","data:image/png;base64,E","data:image/png;base64,F"]}),
+        json!({"prompt":"remote","images":["https://example.test/image.png"]}),
     ] {
         let response = Client::new()
             .post(&image_url)
-            .json(&request)
+            .json(&invalid)
             .send()
             .await
-            .expect("invalid image response");
-        assert_eq!(response.status(), 400);
+            .expect("invalid image");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(
             response
                 .text()
@@ -517,655 +491,27 @@ async fn image_edit_accepts_five_data_images_and_rejects_invalid_inputs() {
                 .contains("invalid_request_error")
         );
     }
-    assert_eq!(image_calls.lock().await.len(), 1);
     bridge_server.abort();
-    upstream_server.abort();
-}
+    origin_server.abort();
 
-#[tokio::test]
-async fn image_errors_are_generic_and_do_not_echo_request_data() {
-    let (upstream, image_calls, upstream_server) = start_image_upstream(true).await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (responses_url, bridge_server) = start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        Some(upstream),
-        None,
-        None,
+    let (image_base, _, failing_origin) = start_image_origin(true).await;
+    let (url, bridge_server) = start_bridge(
+        managed_auth(),
+        "http://127.0.0.1:1".to_owned(),
+        Some(image_base),
     )
     .await;
-    let image_url = responses_url.replace(ENDPOINT, IMAGE_ENDPOINT);
     let response = Client::new()
-        .post(&image_url)
+        .post(url.replace(ENDPOINT, IMAGE_ENDPOINT))
         .header("content-type", "application/json")
         .body(r#"{"prompt":"do-not-echo-this"}"#)
         .send()
         .await
-        .expect("upstream failure response");
-    assert_eq!(response.status(), 502);
-    let body = response.text().await.expect("upstream failure body");
+        .expect("image upstream failure");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("generic error");
     assert!(body.contains("image operation failed"));
     assert!(!body.contains("do-not-echo-this"));
-    assert_eq!(image_calls.lock().await.len(), 1);
-
-    let malformed = Client::new()
-        .post(&image_url)
-        .header("content-type", "application/json")
-        .body("not-json")
-        .send()
-        .await
-        .expect("malformed image response");
-    assert_eq!(malformed.status(), 400);
-    assert!(
-        malformed
-            .text()
-            .await
-            .expect("malformed image body")
-            .contains("invalid_request_error")
-    );
     bridge_server.abort();
-    upstream_server.abort();
-}
-
-#[tokio::test]
-async fn http_sse_and_websocket_use_native_framing_and_no_v1_alias() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge(calls.clone(), cancelled, false).await;
-    let client = Client::new();
-    let response = client
-        .post(&url)
-        .json(&request())
-        .send()
-        .await
-        .expect("HTTP response");
-    assert_eq!(response.status(), 200);
-    let body = response.text().await.expect("SSE body");
-    assert!(body.contains("\"type\":\"response.created\""));
-    assert!(body.contains("response.output_text.delta"));
-    assert!(body.contains("response.completed"));
-    assert!(body.contains("data: [DONE]"));
-    assert!(!body.contains("dummy-key-must-not-echo"));
-
-    let missing = client
-        .post(format!("{url}/v1"))
-        .json(&request())
-        .send()
-        .await
-        .expect("alias response");
-    assert_eq!(missing.status(), 404);
-
-    let ws_url = url.replacen("http", "ws", 1);
-    let (mut socket, _) = connect_async(ws_url).await.expect("WebSocket connection");
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": [{
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": "hello" }]
-                }]
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("request frame");
-    let mut event_types = Vec::new();
-    while let Some(Ok(Message::Text(text))) = socket.next().await {
-        let value: Value = serde_json::from_str(&text).expect("native event JSON");
-        event_types.push(value["type"].as_str().unwrap_or_default().to_owned());
-        if value["type"] == "response.completed" {
-            break;
-        }
-    }
-    assert!(event_types.iter().any(|kind| kind == "response.created"));
-    assert!(
-        event_types
-            .iter()
-            .any(|kind| kind == "response.output_text.delta")
-    );
-    assert!(event_types.iter().any(|kind| kind == "response.completed"));
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": [
-                    {"type":"compaction","encrypted_content":"opaque-checkpoint"},
-                    {"type":"compaction_trigger"}
-                ]
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("WebSocket compaction request");
-    let Some(Ok(Message::Text(text))) = socket.next().await else {
-        panic!("WebSocket compaction rejection");
-    };
-    assert!(text.contains("compaction triggers require HTTP/SSE"));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    server.abort();
-}
-
-#[tokio::test]
-async fn full_context_fallback_rebuilds_websocket_session() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let request_inputs = Arc::new(Mutex::new(Vec::new()));
-    let (url, server) = start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(request_inputs.clone()),
-    )
-    .await;
-    let (mut socket, _) = connect_async(url.replacen("http", "ws", 1))
-        .await
-        .expect("WebSocket connection");
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": "first turn"
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("first request");
-    while let Some(Ok(Message::Text(text))) = socket.next().await {
-        if text.contains("response.completed") {
-            break;
-        }
-    }
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "instructions": "new session instructions",
-                "input": [
-                    {"type":"message","role":"user","content":[{"type":"input_text","text":"first turn"}]},
-                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"bridge text"}]},
-                    {"type":"message","role":"user","content":[{"type":"input_text","text":"second turn"}]}
-                ]
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("full-context fallback request");
-    while let Some(Ok(Message::Text(text))) = socket.next().await {
-        if text.contains("response.completed") {
-            break;
-        }
-    }
-    let inputs = request_inputs.lock().await;
-    assert_eq!(inputs.len(), 2);
-    assert_eq!(inputs[0].len(), 3);
-    assert_eq!(inputs[1].len(), 5);
-    assert!(
-        serde_json::to_string(&inputs[1])
-            .unwrap()
-            .contains("new session instructions")
-    );
-    assert!(
-        serde_json::to_string(&inputs[1])
-            .unwrap()
-            .contains("second turn")
-    );
-    server.abort();
-}
-
-#[tokio::test]
-async fn remote_compaction_forwards_native_sse_and_managed_headers() {
-    let (upstream, upstream_request, upstream_server) = start_compact_upstream().await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge_mode_with_image(
-        calls,
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
-        None,
-        Some(upstream),
-        None,
-    )
-    .await;
-    let request_body = json!({
-        "model": "gpt-5.6-luna",
-        "input": [
-            {"type":"compaction","encrypted_content":"opaque-checkpoint"},
-            {"type":"compaction_trigger"}
-        ],
-        "api_key": "peer-compatibility-key",
-        "stream": true
-    });
-    let response = Client::new()
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .expect("compaction response");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.text().await.expect("compaction SSE body");
-    let expected = r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}}
-
-data: {"type":"response.completed","response":{"id":"resp-upstream","object":"response","status":"completed","output":[{"type":"compaction","id":"cmp-upstream","encrypted_content":"opaque-output"}],"usage":null,"end_turn":true}}
-
-data: [DONE]
-
-"#;
-    assert_eq!(body, expected);
-    let (headers, value) = upstream_request
-        .lock()
-        .await
-        .take()
-        .expect("compaction upstream request");
-    assert_eq!(
-        value["input"].as_array().unwrap().last().unwrap()["type"],
-        "compaction_trigger"
-    );
-    assert_eq!(value["input"][0]["encrypted_content"], "opaque-checkpoint");
-    assert!(value.get("api_key").is_none());
-    assert_eq!(headers["authorization"], "Bearer managed-bearer");
-    assert_eq!(headers["chatgpt-account-id"], "managed-account");
-    assert_eq!(headers["x-openai-fedramp"], "true");
-    assert_eq!(headers["user-agent"], "nanocodex/0.5.0");
-    assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
-    assert_eq!(headers["session-id"], headers["thread-id"]);
-    assert_eq!(headers["session-id"], headers["x-client-request-id"]);
-    assert_eq!(headers["x-codex-beta-features"], "remote_compaction_v2");
-    server.abort();
-    upstream_server.abort();
-}
-
-#[tokio::test]
-async fn malformed_remote_compaction_inputs_are_rejected_before_upstream() {
-    let (upstream, upstream_request, upstream_server) = start_compact_upstream().await;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge_mode_with_image(
-        calls.clone(),
-        cancelled,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        Some(OpenAiAuth::managed_chatgpt(Arc::new(TestManagedAuth))),
-        None,
-        Some(upstream),
-        None,
-    )
-    .await;
-    let client = Client::new();
-    for input in [
-        json!([
-            {"type":"compaction_trigger"},
-            {"type":"compaction","encrypted_content":"opaque"}
-        ]),
-        json!([
-            {"type":"compaction","encrypted_content":"opaque"},
-            {"type":"compaction_trigger"},
-            {"type":"compaction_trigger"}
-        ]),
-        json!([
-            {"type":"compaction","encrypted_content":""},
-            {"type":"compaction_trigger"}
-        ]),
-    ] {
-        let response = client
-            .post(&url)
-            .json(&json!({"model":"gpt-5.6-luna","input":input}))
-            .send()
-            .await
-            .expect("invalid compaction response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            response
-                .text()
-                .await
-                .expect("invalid compaction body")
-                .contains("invalid_request_error")
-        );
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(upstream_request.lock().await.is_none());
-    server.abort();
-    upstream_server.abort();
-}
-
-#[tokio::test]
-async fn native_output_items_keep_their_indices() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge_mode(
-        calls.clone(),
-        cancelled,
-        false,
-        false,
-        true,
-        None,
-        None,
-        None,
-    )
-    .await;
-    let body = Client::new()
-        .post(&url)
-        .json(&request())
-        .send()
-        .await
-        .expect("multi-output response")
-        .text()
-        .await
-        .expect("multi-output SSE body");
-    let events = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .collect::<Vec<_>>();
-    for event_type in [
-        "response.output_item.added",
-        "response.output_text.delta",
-        "response.output_item.done",
-    ] {
-        let indices = events
-            .iter()
-            .filter(|event| event["type"] == event_type)
-            .map(|event| event["output_index"].as_u64())
-            .collect::<Vec<_>>();
-        assert_eq!(indices, [Some(0), Some(1)]);
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    server.abort();
-}
-
-#[tokio::test]
-async fn http_sse_accepts_zstd_and_limits_expanded_requests() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge(calls.clone(), cancelled, false).await;
-    let client = Client::new();
-
-    let body = serde_json::to_vec(&request()).expect("request JSON");
-    let compressed = zstd::stream::encode_all(body.as_slice(), 3).expect("compressed request");
-    let response = client
-        .post(&url)
-        .header("content-encoding", "zstd")
-        .body(compressed)
-        .send()
-        .await
-        .expect("zstd response");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response
-            .text()
-            .await
-            .expect("zstd SSE body")
-            .contains("response.completed")
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-    let mut oversized = request();
-    oversized["input"] = Value::String("x".repeat(4 * 1024 * 1024));
-    let body = serde_json::to_vec(&oversized).expect("oversized request JSON");
-    let compressed =
-        zstd::stream::encode_all(body.as_slice(), 3).expect("compressed oversized request");
-    let response = client
-        .post(&url)
-        .header("content-encoding", "zstd")
-        .body(compressed)
-        .send()
-        .await
-        .expect("oversized zstd response");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        response
-            .text()
-            .await
-            .expect("oversized error body")
-            .contains("request body is too large")
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-    let response = client
-        .post(&url)
-        .header("content-encoding", "gzip")
-        .body(serde_json::to_vec(&request()).expect("plain request JSON"))
-        .send()
-        .await
-        .expect("unsupported encoding response");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(
-        response
-            .text()
-            .await
-            .expect("unsupported encoding error body")
-            .contains("unsupported content encoding")
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    server.abort();
-}
-
-#[tokio::test]
-async fn invalid_input_and_downstream_cancellation_stop_upstream() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge(calls.clone(), cancelled.clone(), true).await;
-    let client = Client::new();
-    let response = client
-        .post(&url)
-        .json(&json!({
-            "model": "gpt-5.6-luna",
-            "input": "hello",
-            "store": true,
-            "api_key": "secret-sentinel"
-        }))
-        .send()
-        .await
-        .expect("invalid response");
-    let body = response.text().await.expect("invalid SSE body");
-    assert!(body.contains("invalid_request_error"));
-    assert!(!body.contains("secret-sentinel"));
-
-    let mut previous_request = request();
-    previous_request["previous_response_id"] = Value::String("resp_missing".to_owned());
-    let response = client
-        .post(&url)
-        .json(&previous_request)
-        .send()
-        .await
-        .expect("previous-response rejection");
-    assert_eq!(response.status(), 400);
-    assert!(
-        response
-            .text()
-            .await
-            .expect("previous-response error body")
-            .contains("previous_response_id is only supported on WebSocket")
-    );
-
-    let response = client
-        .post(&url)
-        .json(&json!({
-            "model": "gpt-5.6-luna",
-            "input": [
-                {"type": "compaction_trigger"},
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "late"}]}
-            ]
-        }))
-        .send()
-        .await
-        .expect("rich-input rejection");
-    assert_eq!(response.status(), 400);
-    assert!(
-        response
-            .text()
-            .await
-            .expect("rich-input error body")
-            .contains("compaction trigger must be the final input item")
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-    let response = client
-        .post(&url)
-        .json(&request())
-        .send()
-        .await
-        .expect("HTTP streaming response");
-    assert_eq!(response.status(), 200);
-    drop(response);
-    wait_until_cancelled(&cancelled).await;
-
-    cancelled.store(false, Ordering::SeqCst);
-    let ws_url = url.replacen("http", "ws", 1);
-    let (mut socket, _) = connect_async(&ws_url).await.expect("WebSocket connection");
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": "cancel me"
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("request frame");
-    let _ = socket.next().await;
-    socket
-        .send(Message::Text("{\"type\":\"response.cancel\"}".into()))
-        .await
-        .expect("cancel frame");
-    wait_until_cancelled(&cancelled).await;
-
-    cancelled.store(false, Ordering::SeqCst);
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": "disconnect me"
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("fresh request after cancellation");
-    let _ = socket.next().await;
-    socket.close(None).await.expect("close socket");
-    wait_until_cancelled(&cancelled).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
-    server.abort();
-}
-
-#[tokio::test]
-async fn image_and_function_output_continuation_remain_typed() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let image_seen = Arc::new(AtomicBool::new(false));
-    let output_seen = Arc::new(AtomicBool::new(false));
-    let output_image_seen = Arc::new(AtomicBool::new(false));
-    let (url, server) = start_bridge_mode(
-        calls.clone(),
-        cancelled,
-        false,
-        true,
-        false,
-        Some(image_seen.clone()),
-        Some(output_seen.clone()),
-        Some(output_image_seen.clone()),
-    )
-    .await;
-    let (mut socket, _) = connect_async(url.replacen("http", "ws", 1))
-        .await
-        .expect("WebSocket connection");
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "input": [{"type":"message","role":"user","content":[
-                    {"type":"input_text","text":"Find Paris weather"},
-                    {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
-                ]}],
-                "tools": [{"type":"function","name":"lookup","description":"look up weather","strict":null,"parameters":{"type":"object"}}]
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("first request");
-    let mut first_response_id = None;
-    while let Some(Ok(Message::Text(text))) = socket.next().await {
-        let value: Value = serde_json::from_str(&text).expect("first native event JSON");
-        if value["type"] == "response.completed" {
-            first_response_id = value["response"]["id"].as_str().map(str::to_owned);
-            break;
-        }
-    }
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "response.create",
-                "model": "gpt-5.6-luna",
-                "previous_response_id": first_response_id.expect("first response ID"),
-                "input": [
-                    {"type":"message","role":"user","content":[
-                        {"type":"input_text","text":"Find Paris weather"},
-                        {"type":"input_image","image_url":"data:image/png;base64,AAAA"}
-                    ]},
-                    {"type":"function_call","id":"fc-test","name":"lookup","arguments": r#"{"city":"Paris"}"#,"call_id":"call-test"},
-                    {"type":"function_call_output","call_id":"call-test","output":[
-                        {"type":"input_text","text":"sunny"},
-                        {"type":"input_image","image_url":"data:image/png;base64,BBBB"}
-                    ]}
-                ],
-                "tools": [{"type":"function","name":"lookup","description":"look up weather","parameters":{"type":"object"}}]
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .expect("continuation request");
-    let mut completed = false;
-    while let Some(Ok(Message::Text(text))) = socket.next().await {
-        if text.contains("response.completed") {
-            completed = true;
-            break;
-        }
-    }
-    assert!(completed);
-    assert!(image_seen.load(Ordering::SeqCst));
-    assert!(output_seen.load(Ordering::SeqCst));
-    assert!(output_image_seen.load(Ordering::SeqCst));
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    server.abort();
+    failing_origin.abort();
 }
