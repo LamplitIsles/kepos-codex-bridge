@@ -133,9 +133,13 @@ async fn recording_responses(
         json!({"type":"response.completed","response":{"id":"normal-response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"relay answer"}]}],"usage":null}})
     };
     let body = format!("event: opaque\ndata: {}\n\ndata: [DONE]\n\n", completed);
-    Response::builder()
-        .status(state.response_status)
+    let mut response = Response::builder().status(state.response_status);
+    if state.response_status.is_redirection() {
+        response = response.header("location", "/redirected");
+    }
+    response
         .header("content-type", "text/event-stream")
+        .header("content-length", body.len().to_string())
         .header("x-codex-turn-state", "client-owned-turn")
         .header("x-reasoning-included", "true")
         .header("set-cookie", "upstream-secret=never-forward")
@@ -202,7 +206,7 @@ async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
     let (origin, requests, origin_server) =
         start_recording_origin(false, StatusCode::CREATED).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
-    let opaque = br#"{"model":"arbitrary-client-model","input":[{"role":"developer","content":"keep all fields"}],"prompt_cache_key":"cache-client","previous_response_id":"response-client","additional_tools":[{"type":"computer"}],"client_metadata":{"opaque":"value"}}"#;
+    let opaque = br#"{"model":"arbitrary-client-model","input":[{"role":"developer","content":"keep all fields"},{"type":"compaction_trigger"}],"prompt_cache_key":"cache-client","previous_response_id":"response-client","additional_tools":[{"type":"computer"}],"client_metadata":{"opaque":"value"}}"#;
     let compressed = zstd::stream::encode_all(&opaque[..], 3).expect("compress request");
     let response = Client::new()
         .post(format!("{url}?client-query=opaque"))
@@ -229,7 +233,12 @@ async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
         "client-owned-turn"
     );
     assert!(!response.headers().contains_key("set-cookie"));
+    let content_length = response.headers()["content-length"]
+        .to_str()
+        .expect("content length")
+        .to_owned();
     let sse = response.bytes().await.expect("SSE bytes");
+    assert_eq!(content_length, sse.len().to_string());
     assert!(sse.starts_with(b"event: opaque\ndata: "));
     assert!(sse.ends_with(b"data: [DONE]\n\n"));
 
@@ -253,6 +262,43 @@ async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
     for name in ["x-api-key", "cookie"] {
         assert!(!recorded.headers.contains_key(name));
     }
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn relays_redirect_response_without_following_it() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::FOUND).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("non-redirecting client");
+    let response = client
+        .post(&url)
+        .body("opaque request")
+        .send()
+        .await
+        .expect("relay response");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.headers()["location"], "/redirected");
+    assert!(!response.bytes().await.expect("redirect bytes").is_empty());
+    assert_eq!(requests.lock().await.len(), 1);
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn unsupported_route_remains_absent() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, "/codex/unsupported"))
+        .send()
+        .await
+        .expect("unsupported response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(requests.lock().await.is_empty());
     bridge_server.abort();
     origin_server.abort();
 }

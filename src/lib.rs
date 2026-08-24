@@ -40,7 +40,8 @@ const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 #[derive(Clone)]
 pub struct Bridge {
     auth: OpenAiAuth,
-    client: reqwest::Client,
+    responses_client: reqwest::Client,
+    image_client: reqwest::Client,
     image_api_base_url: Arc<str>,
     responses_api_base_url: Arc<str>,
 }
@@ -52,7 +53,11 @@ impl Bridge {
         let base_url: Arc<str> = Arc::from(auth.mode().default_api_base_url());
         Self {
             auth,
-            client: reqwest::Client::new(),
+            responses_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Responses client configuration is valid"),
+            image_client: reqwest::Client::new(),
             image_api_base_url: base_url.clone(),
             responses_api_base_url: base_url,
         }
@@ -130,7 +135,7 @@ impl Bridge {
         auth: &OpenAiAuthSnapshot,
     ) -> Result<reqwest::Response, ()> {
         let mut request = self
-            .client
+            .responses_client
             .post(endpoint)
             .headers(forward_request_headers(headers))
             .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()))
@@ -277,7 +282,7 @@ impl Bridge {
         auth: &OpenAiAuthSnapshot,
     ) -> Result<reqwest::Response, ()> {
         let mut request = self
-            .client
+            .image_client
             .post(endpoint)
             .header(USER_AGENT, NANOCODEX_USER_AGENT)
             .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()));
@@ -383,11 +388,15 @@ fn forward_headers(headers: &HeaderMap, direction: HeaderDirection) -> HeaderMap
     let connection_headers = connection_header_names(headers);
     let mut forwarded = HeaderMap::new();
     for (name, value) in headers {
-        if is_hop_by_hop(name, &connection_headers) || name == header::CONTENT_LENGTH {
+        if is_hop_by_hop(name, &connection_headers) {
             continue;
         }
         match direction {
-            HeaderDirection::Request if is_peer_identity_header(name) => continue,
+            HeaderDirection::Request
+                if name == header::CONTENT_LENGTH || is_peer_identity_header(name) =>
+            {
+                continue;
+            }
             HeaderDirection::Response if name == header::SET_COOKIE => continue,
             _ => {}
         }
