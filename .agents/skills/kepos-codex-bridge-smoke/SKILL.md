@@ -134,23 +134,31 @@ disabled.
 For an agent-driven manual `/compact` smoke, discover Herdr before starting
 Pi: call `tools.search({ query: "herdr" })`, then `tools.describe` the
 returned layout, agent, and pane tools. Use their discovered references and
-schemas; do not substitute a raw shell PTY driver.
+schemas. If a discovered mutating wrapper reports `Expected JSON output from
+herdr ...`, do not fall back to a raw shell PTY: verify `HERDR_ENV=1`, read
+`herdr --skill`, then use the installed native `herdr` CLI. Its current
+`--help` output is authoritative.
 
 1. Create a fresh Herdr workspace/tab or shell pane with the discovered layout
-   tool.
-2. Start exactly one `kind: "pi"` agent in that new pane through the
-   discovered agent tool. Pass only the isolated profile, session, model, and
-   exactly one compaction extension through `agentArgs`; do not put the task
-   in `agentArgs`.
-3. Send the normal task with `herdr_agent.prompt` and wait for `idle` or
-   `done`. For a long cache prefix, keep the corpus in a test-owned file and
-   send only a short task that refers to it.
-4. Send `/compact` through the same agent tool after the normal task settles,
-   wait for it to settle, then send one normal follow-up through that same
-   agent.
+   tool or equivalent native CLI command.
+2. Start exactly one `kind: "pi"` agent in that new pane. Pass only the
+   isolated profile, session, model, and exactly one compaction extension
+   through `agentArgs`; do not put the task in `agentArgs`.
+3. Send the normal task through the agent prompt surface and wait for `idle`
+   or `done`. For a long cache path, keep the corpus outside controller
+   context. Confirm the expected input/cache telemetry after the task: a typed
+   `@file` may remain a literal TUI string. If it does not create the target
+   path, send bounded normal prompts sourced from the test-owned corpus until
+   the target is reached; keep every prompt below the native command argument
+   limit.
+4. Send `/compact` through that same agent after the normal task settles,
+   then send one normal follow-up through the same agent. An
+   `agent_prompt_stalled` result is not by itself a failed compaction: first
+   check the session structurally. If one new `compaction` entry with numeric
+   usage exists, it succeeded; do not retry it.
 5. Use lifecycle state plus structural/numeric session telemetry for the
    verdict. Do not read the terminal transcript or request body. Close only
-   the created pane with the discovered pane tool.
+   the created pane with the discovered pane tool or native CLI.
 
 ## Nanocodex and scope
 
