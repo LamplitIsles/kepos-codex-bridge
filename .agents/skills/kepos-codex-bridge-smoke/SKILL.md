@@ -144,18 +144,21 @@ herdr ...`, do not fall back to a raw shell PTY: verify `HERDR_ENV=1`, read
 2. Start exactly one `kind: "pi"` agent in that new pane. Pass only the
    isolated profile, session, model, and exactly one compaction extension
    through `agentArgs`; do not put the task in `agentArgs`.
-3. Send the normal task through the agent prompt surface and wait for `idle`
-   or `done`. For a long cache path, keep the corpus outside controller
-   context. Confirm the expected input/cache telemetry after the task: a typed
-   `@file` may remain a literal TUI string. If it does not create the target
-   path, send bounded normal prompts sourced from the test-owned corpus until
-   the target is reached; keep every prompt below the native command argument
+3. Send a normal repository task through the agent prompt surface and wait for
+   `idle` or `done`. Name the files the agent must read, ask an observable
+   question about them, and prohibit edits; confirm the resulting input/cache
+   telemetry before compaction. This is the default cache path. Do not use
+   synthetic chunks merely to make the context large. A bounded test-owned
+   corpus is only for an explicitly requested cache-threshold or stress probe;
+   keep it outside controller context and below the native command argument
    limit.
-4. Send `/compact` through that same agent after the normal task settles,
-   then send one normal follow-up through the same agent. An
-   `agent_prompt_stalled` result is not by itself a failed compaction: first
-   check the session structurally. If one new `compaction` entry with numeric
-   usage exists, it succeeded; do not retry it.
+4. After the normal task settles, use that agent's Herdr pane to send literal
+   `/compact` with `send_text` followed by `send_keys: enter` (or the
+   equivalent native `herdr pane send-text` and `send-keys` commands).
+   Do not use the agent prompt surface for the slash command: bracketed paste
+   may leave it undispatched in Pi. Wait for the session structurally. If one
+   new `compaction` entry with numeric usage exists, it succeeded; do not
+   retry it. Then send one normal follow-up through the agent prompt surface.
 5. Use lifecycle state plus structural/numeric session telemetry for the
    verdict. Do not read the terminal transcript or request body. Close only
    the created pane with the discovered pane tool or native CLI.
