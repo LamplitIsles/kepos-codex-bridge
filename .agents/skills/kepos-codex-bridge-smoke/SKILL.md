@@ -102,7 +102,8 @@ pi --session-dir "$ROOT/sessions" \
 Complete one normal turn, run manual `/compact`, then complete one normal
 follow-up. Ogul owns Remote Compaction V2 and its opaque checkpoint. Record
 only whether the configured route was used, each step succeeded or failed, and
-numeric usage/cache telemetry.
+numeric usage/cache telemetry. For an agent-driven manual sequence, use the
+Herdr driver below.
 
 ## Pi compat Lite row
 
@@ -120,7 +121,29 @@ pi --session-dir "$ROOT/sessions" \
 
 Complete the same normal → manual `/compact` → normal follow-up sequence.
 The package owns Lite construction, cache lineage, continuation, and Remote V2
-state; do not inspect their values. Record only the allowed result fields.
+state; do not inspect their values. Record only the allowed result fields. For
+a controlled envelope comparison, run this same package in separate fresh
+sessions with `PI_OPENAI_CODEX_COMPAT_RESPONSES_LITE=on` and `=off`, using
+distinct long static prefixes to prevent cross-row reuse. The off row is not
+the Stock Pi + Ogul row; test that client separately.
+
+## Manual compaction driver
+
+For an agent-driven manual `/compact` smoke, use Pi Herdr rather than a raw
+shell PTY driver:
+
+1. Create an isolated Herdr workspace/tab or pane with
+   `extensions.herdr_layout`.
+2. Start exactly one `kind: "pi"` agent in that new shell pane through
+   `extensions.herdr_agent`. Pass the isolated profile, session, model, and
+   one compaction extension through `agentArgs`; use a test-owned `@file`
+   for a large static corpus rather than putting it in a tool prompt.
+3. Wait for the normal turn to become idle, submit `/compact` with
+   `herdr_agent.prompt`, wait again, then submit the normal follow-up through
+   the same agent.
+4. Use lifecycle state plus structural/numeric session telemetry for the
+   verdict. Do not read the terminal transcript or request body. Close only
+   the pane created for the probe with `extensions.herdr_pane`.
 
 ## Nanocodex and scope
 
