@@ -7,12 +7,17 @@ description: Use when running or debugging a Pi session through this repository'
 
 ## Guardrails
 
-Run an approved live probe only with a fresh, mode-`0700` test root, test-owned
-Pi profile/session directories, a separate loopback bridge process and port,
-and a dedicated test-owned managed-auth file. Preserve existing bridge
-processes, live profiles, auth files, and sessions. If the managed OAuth cannot
-be used by that isolated bridge without touching a live auth file, stop and
-report that concrete blocker; do not improvise a credential path.
+Run an approved live probe with a fresh, mode-`0700` test root, test-owned
+Pi profile/session directories, and a separate loopback bridge process and
+port. Preserve existing bridge processes, live profiles, and sessions.
+
+When the user explicitly approves a live-auth smoke, pass the existing
+managed-auth file to the isolated bridge only as an opaque `--auth-file`
+reference. Do not open, parse, copy, log, hash, retain, or put its contents in
+a Pi profile; do not run bridge login or otherwise alter the file yourself.
+The bridge may perform its normal upstream-401 recovery. If authentication
+still fails, stop and report rather than intervene with the credential.
+Without explicit approval, require a test-owned managed-auth file.
 
 Never print or retain OAuth data, placeholders, prompts, request bodies,
 opaque checkpoints, or session contents. Retain only route confirmation,
@@ -76,8 +81,9 @@ Before the first request in either row:
   `/codex/responses` base URL;
 - confirm the temporary bridge listener is bound on `$PORT`;
 - confirm Pi's selected model is `$MODEL`;
-- confirm the process/auth/profile/session paths belong to the new test root,
-  not a live client or bridge.
+- confirm the bridge process, Pi profile, and session paths belong to the new
+  test root; with explicitly approved live auth, confirm only the opaque
+  `--auth-file` reference is external.
 
 Only after all four checks may the client call the model.
 
