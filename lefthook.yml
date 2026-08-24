@@ -1,0 +1,11 @@
+pre-commit:
+  commands:
+    cargo-fmt:
+      run: cargo fmt --check
+
+pre-push:
+  commands:
+    cargo-test:
+      run: cargo test --all-targets
+    cargo-clippy:
+      run: cargo clippy --all-targets --all-features -- -D warnings

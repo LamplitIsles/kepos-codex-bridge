@@ -1,48 +1,43 @@
 # kepos-codex-bridge
 
-A small Linux `x86_64` service that keeps one Codex `auth.json` on the bridge
-host and exposes the native Codex Responses stream to permitted Kepos peers.
-It is a relay, not an agent runtime: Pi or DSH owns history policy, tool
-execution, and cancellation decisions.
+A small Linux `x86_64` loopback service that supplies one bridge-host ChatGPT
+OAuth identity to permitted Kepos peers. It is a transparent Codex Responses
+relay, not an agent runtime: the connected client owns its request shape,
+history, Lite rendering, cache lineage, continuations, tools, and compaction.
 
 ## Public contract
 
-The bridge publishes two sibling routes through the same HTTP service:
+The bridge publishes two fixed sibling routes:
 
-- `POST /codex/responses` accepts a full streaming native Responses request (it
-  rejects `previous_response_id`) and returns `text/event-stream`; events are
-  `data: {native JSON}\n\n` followed by `data: [DONE]\n\n`. WebSocket upgrade on
-  the same route accepts text `response.create` frames and returns native
-  response event frames. `response.cancel` cancels the active operation. This
-  route retains its existing 4 MiB request limit.
-- `POST /codex/images` accepts JSON `{ "prompt": string, "images"?: string[] }`.
-  A nonblank prompt with no images performs generation; one through five
-  `data:image/...` inputs performs editing. The route returns exactly
-  `{ "image_url": "data:image/png;base64,..." }` and has a 32 MiB encoded
-  request limit. `api_key` may be supplied only as ignored compatibility data;
-  all other unknown fields are rejected.
+- `POST /codex/responses` forwards an HTTP/SSE Responses request. It retains a
+  4 MiB encoded request limit and streams the final upstream status, safe
+  end-to-end headers, and bytes unchanged.
+- `GET /codex/responses` accepts a WebSocket upgrade. It retains the client
+  query and application headers, forwards Text and Binary frames unchanged,
+  propagates Close, and lets the endpoint libraries handle Ping/Pong.
+- `POST /codex/images` retains the existing fixed image capability: JSON
+  `{ "prompt": string, "images"?: string[] }`, a 32 MiB encoded limit, and
+  exactly `{ "image_url": "data:image/png;base64,..." }`. A prompt alone
+  generates; one through five `data:image/...` inputs edit.
 
-The image route is a fixed Codex capability boundary, not a general OpenAI
-Images API. It does not accept multipart bodies, remote URLs, file paths,
-provider options, or `/v1` aliases. The bridge selects `gpt-image-2` and the
-fixed Nanocodex-compatible `background`, `quality`, and `size` values. Future
-clients own image loading, history selection, tool schemas, artifacts, and
-rendering.
+Responses is JSON-opaque. The relay forwards client-controlled model,
+instructions, Lite/beta/cache/session/thread/request headers, continuation
+state, opaque checkpoints, and compressed bodies without decoding or
+reserializing them. It removes peer `Authorization`, `Proxy-Authorization`,
+`X-Api-Key`, `Cookie`, account, and FedRAMP identity headers; it then injects
+the bridge's managed bearer/account identity. A pre-stream or pre-upgrade
+upstream 401 receives one managed-OAuth refresh retry. The relay never exposes
+upstream cookies or manufactures SSE events, Responses IDs, or protocol state.
 
-Incoming API keys are compatibility data only. They are ignored and never
-become upstream credentials. The bridge loads only its local managed ChatGPT
-OAuth identity. Kepos Noise peer identity and the publisher allowlist are the
-access-control boundary; the bridge adds no application bearer token.
-
-`nanocodex-oai-api` owns managed refresh, WebSocket retry, and the bounded
-WebSocket-to-HTTP/SSE fallback. The bridge does not add a retry coordinator,
-tool executor, deduplicator, database, queue, or durable continuation store.
-Cancellation and disconnect drop the connection-scoped session operation.
+There is no `/v1` alias, `/compact` route, model alias, client-facing mode
+switch, or fixed `--model`/`--instructions` serve option. Model and instructions
+belong to the caller. `/codex/images` remains a fixed capability, not a generic
+Images API.
 
 ## Build
 
-The release artifact is one Linux `x86_64` binary. Build it on the target Linux
-host or in the approved Linux build environment:
+Build the single Linux release artifact on the target Linux host or approved
+Linux build environment:
 
 ```bash
 cargo build --release --target x86_64-unknown-linux-gnu
@@ -52,138 +47,161 @@ cargo build --release --target x86_64-unknown-linux-gnu
 This repository deliberately adds no Docker image, container manifest, Helm
 chart, non-Linux target, or other platform package.
 
-## Operator setup
+## Bridge-host setup and Kepos publication
 
-Select a private writable credential path. Do not use a client application's
-credential directory as a test fixture or copy this file to peers.
+Keep the managed OAuth file private and writable only by its owner. It belongs
+on the bridge host; never copy it to a peer or put it in a Pi profile.
 
 ```bash
 export KEPOS_CODEX_AUTH_FILE=/var/lib/kepos-codex-bridge/auth.json
 kepos-codex-bridge login --auth-file "$KEPOS_CODEX_AUTH_FILE"
+kepos-codex-bridge serve --auth-file "$KEPOS_CODEX_AUTH_FILE" --port 8787
 ```
 
-`login` runs the upstream browser PKCE flow and writes the Codex-compatible
-file atomically. A deployment that receives a private secret mount must copy
-it into this owner-only writable path before starting the service. Serving
-checks the file before binding and refuses group/other permissions or invalid
-managed credentials.
+The listener is `127.0.0.1:8787` by default. It does not terminate TLS or
+publish login, token inspection, logout, metrics, or admin endpoints.
 
-Start the loopback listener:
-
-```bash
-kepos-codex-bridge serve \
-  --auth-file "$KEPOS_CODEX_AUTH_FILE" \
-  --port 8787 \
-  --model gpt-5.6-luna
-```
-
-The listener is `127.0.0.1:8787` by default. It does not terminate TLS and it
-does not expose login, token inspection, logout, metrics, or admin routes.
-
-## Kepos publication
-
-Publish the bridge as a **named Kepos HTTP service** whose target is the local
-loopback port `8787` (or the selected `--port`). Use the normal Kepos HTTP /
-WebSocket-over-Noise publisher path, not a raw TCP service and not a separate
-WSS listener. Set the service allowlist to the peer public keys allowed to use
-this subscription; inheriting the publisher allowlist is acceptable when it is
-already narrow.
-
-The client-side endpoints are the named HTTP service URL produced by Kepos
-with `/codex/responses` or `/codex/images` appended. The publisher target
-remains plain local HTTP; the peer leg is protected by Kepos Noise. Exact
-service naming and allowlist syntax belongs to the Kepos deployment
-configuration, for example:
+Publish it as a **named Kepos HTTP service** targeting that loopback port, using
+the normal HTTP/WebSocket-over-Noise publisher path. Allowlist only the peer
+public keys authorized to use the bridge subscription:
 
 ```text
 service name: codex-bridge
 publisher target: http://127.0.0.1:8787
 paths: /codex/responses and /codex/images
 transport: standard Kepos HTTP service (HTTP + WebSocket upgrade for Responses)
-allowlist: the approved Pi/DSH peer public keys
+allowlist: approved peer public keys
 ```
 
-Do not put `auth.json`, an OAuth refresh token, or a bridge bearer token in the
-Kepos service definition or in a client configuration.
+Kepos peer identity and its publisher allowlist are the authorization boundary.
+An allowed peer can use the bridge account, so do not publish this service to
+untrusted peers. The bridge adds no bearer authentication, account
+multiplexing, token inspection, request-body logging, conversation persistence,
+or prompt-cache registry.
 
-## Pi and DSH configuration
+## Test-owned client setup
 
-Configure the existing native `openai-codex-responses` provider to use the
-Kepos service URL at `/codex/responses`, with the fixed model
-`gpt-5.6-luna`. No client-side OAuth login is configured.
+Use a fresh, private test root for each probe. The examples use a synthetic,
+non-secret JWT-shaped placeholder because Pi validates the local
+`chatgpt_account_id` claim before connecting. It is ignored by the relay; never
+substitute a real Codex OAuth token.
 
-Pi 0.84.1 needs a syntactically JWT-shaped, non-secret placeholder because its
-native Codex adapter locally reads a `chatgpt_account_id` claim before it
-connects. The bridge ignores that value; it is never forwarded upstream. An
-arbitrary nonempty string such as `bridge-placeholder` is not sufficient for
-Pi. Use a test-owned Pi config directory containing:
-
-`models.json`:
-
-```json
-{
-  "providers": {
-    "openai-codex": {
-      "baseUrl": "<Kepos HTTP service URL>/codex/responses",
-      "apiKey": "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoidGVzdC1hY2NvdW50In19.dummy"
-    }
-  }
-}
+```bash
+umask 077
+ROOT=$(mktemp -d)
+MODEL='<client-selected Codex model>'
+RELAY='http://127.0.0.1:<bridge-port>/codex/responses'
+PLACEHOLDER='eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoidGVzdC1hY2NvdW50In19.dummy'
+mkdir -p "$ROOT/pi-agent" "$ROOT/sessions"
+cat >"$ROOT/pi-agent/models.json" <<EOF
+{"providers":{"openai-codex":{"baseUrl":"$RELAY","apiKey":"$PLACEHOLDER"}}}
+EOF
+cat >"$ROOT/pi-agent/settings.json" <<EOF
+{"defaultProvider":"openai-codex","defaultModel":"$MODEL","transport":"websocket"}
+EOF
 ```
 
-`settings.json`:
+Before any paid request, read that test `models.json`, confirm the selected
+model, and confirm a listener is bound at the loopback port. A system
+`HTTP_PROXY` or Clash/Mihomo setting affects egress only; it does not configure
+the model endpoint. The explicit route must be:
 
-```json
-{
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.6-luna",
-  "transport": "websocket"
-}
+```text
+Pi -> 127.0.0.1:<bridge-port>/codex/responses -> managed Codex upstream
 ```
 
-Set `PI_CODING_AGENT_DIR` to that directory. Pi attempts WebSocket first and
-may fall back to SSE before its first event. Other clients should use whatever
-non-secret placeholder shape their own Codex adapter requires.
+### Stock Pi with Ogul Remote Compaction V2
 
-Pi and DSH continue to send native function calls, receive them, execute tools
-locally, and send the native function-call output continuation. The bridge
-never executes or deduplicates those calls.
+Do not run Pi OAuth login in this profile. Start Pi with the isolated profile,
+session directory, and exactly the Ogul compaction extension:
+
+```bash
+PI_CODING_AGENT_DIR="$ROOT/pi-agent" \
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+pi --session-dir "$ROOT/sessions" \
+  --provider openai-codex --model "$MODEL" \
+  --extension "$HOME/.pi/agent/npm/node_modules/@ogulcancelik/pi-codex-compaction/index.ts"
+```
+
+Run one normal turn, invoke `/compact` manually, then run one normal follow-up.
+Ogul owns the Remote Compaction V2 request and opaque checkpoint; the relay
+neither interprets nor stores either. Retain only route confirmation,
+success/failure, and numeric input/cache-read/cache-write usage. Do not retain
+prompts, request bodies, checkpoints, OAuth data, or test session files.
+
+### Pi `pi-openai-codex-compat` with Responses Lite
+
+Use the same isolated Pi profile and placeholder, install/load the package in
+that test-owned profile, and explicitly enable Lite. An environment override
+keeps the setting out of a live profile:
+
+```bash
+PI_CODING_AGENT_DIR="$ROOT/pi-agent" \
+PI_OPENAI_CODEX_COMPAT_RESPONSES_LITE=on \
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+pi --session-dir "$ROOT/sessions" \
+  --provider openai-codex --model "$MODEL" \
+  --extension '<test-owned pi-openai-codex-compat extension path>'
+```
+
+Again run normal → manual `/compact` → normal follow-up. Lite request fields,
+`additional_tools`, client metadata, cache keys, and continuation state are
+client-owned and pass through untouched except for managed identity.
+
+### Pinned Nanocodex endpoint overrides
+
+Nanocodex needs no bridge-specific session adapter. Configure its public
+endpoints and a non-secret local API-key placeholder; choose its normal
+transport as needed:
+
+```rust
+let openai = OpenAi::builder("nonsecret-local-placeholder")
+    .model(Model::Luna)
+    .api_base_url("http://127.0.0.1:<bridge-port>/codex")
+    .websocket_url("ws://127.0.0.1:<bridge-port>/codex/responses")
+    .build()?;
+```
+
+Its own `Session::turn().create()` and `turn().compact()` then use the selected
+HTTP or WebSocket transport. The pinned client is verified against a hermetic
+recording origin; it does not require a separate paid live run.
 
 ## Verification
 
-Hermetic adapter tests use a deterministic Tower service and no credentials,
-live configuration, or production service:
+Hermetic relay and image checks require no live credentials or services:
 
 ```bash
+cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release --target x86_64-unknown-linux-gnu
 ```
 
-They cover matching HTTP/SSE and WebSocket framing, the missing `/v1` alias,
-placeholder-key redaction, Luna image typing, typed function-call output image
-continuation, the image generation/edit contract and boundaries, generic image
-failures, and cancellation/disconnect propagation. Upstream Nanocodex transport
-and Kepos ACL matrices are intentionally not duplicated.
+### Git hooks
 
-The non-hermetic Pi acceptance probe is an operator/deployment check, not a CI
-or agent test. Run one combined Pi probe after installing Pi and configuring a
-test-owned client profile. It must cover WebSocket text, a Luna image, one
-function-call round, and cancellation; a missing Pi or test profile is a
-failure, not a skip. DSH remains a documented native consumer of the shared
-endpoint, but this repository does not install, configure, or exercise DSH and
-does not carry a DSH-specific adapter, fixture, or heavy integration harness.
-Validate a later DSH integration separately against an already-running DSH.
-Operator publication verification must use the same named, allowlisted Kepos
-HTTP service for `/codex/images` and a test-owned rejected request to confirm
-that no intermediary imposes a lower-than-32-MiB bound; it must not trigger
-image generation or mutate OAuth state. The minimal live OAuth request is an
-explicitly approved deployment validation and must use a dedicated bridge
-credential file; it is never run by CI or this repository's automated tests.
+Install [Lefthook](https://lefthook.dev/) once, then activate the repository hooks:
 
-## Scope and security boundary
+```bash
+lefthook install
+```
 
-This is a single-node, in-memory bridge. It keeps no cross-connection
-continuation state and drops a live operation on completion, cancellation,
-disconnect, or failed transport. Transport faults therefore retain Nanocodex's
-bounded at-least-once behavior; the bridge makes no exactly-once or external
-tool-effect guarantee.
+`pre-commit` verifies formatting. `pre-push` runs the hermetic test suite and
+Clippy with warnings denied. GitHub Actions repeats those checks and the Linux
+release build for every pull request.
+
+For the explicitly approved live acceptance matrix, start a separate temporary
+loopback bridge using a dedicated, test-owned managed-auth file and port. Do
+not reuse, stop, or refresh an existing bridge process or its auth file. Verify
+the test profile route, listener, and model before each row; run the Stock
+Pi+Ogul and Pi compat Lite normal → compact → follow-up rows; then securely
+remove only the test root and the temporary bridge it started. A cache hit is
+an observed provider result, not a guarantee or CI assertion.
+
+## Scope exclusions
+
+The bridge does not validate DSH. It does not validate or proxy Pi compat's
+optional image or web companion endpoints. It is not a bridge-side Lite
+renderer, Responses schema adapter, session/cache owner, compaction encoder,
+durable store, generic reverse proxy, or cache-hit guarantee. Pi, Ogul,
+Nanocodex, and `pi-openai-codex-compat` remain unmodified clients that own
+reconnection, retry, continuation, history, and all client protocol state.
