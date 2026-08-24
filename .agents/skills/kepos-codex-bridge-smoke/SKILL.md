@@ -87,7 +87,7 @@ Before the first request in either row:
 
 Only after all four checks may the client call the model.
 
-## Stock Pi + Ogul row
+## Stock Pi + Ogul row (Lite off)
 
 Launch exactly one isolated Pi process with Ogul:
 
@@ -99,13 +99,17 @@ pi --session-dir "$ROOT/sessions" \
   --extension "$HOME/.pi/agent/npm/node_modules/@ogulcancelik/pi-codex-compaction/index.ts"
 ```
 
-Complete one normal turn, run manual `/compact`, then complete one normal
-follow-up. Ogul owns Remote Compaction V2 and its opaque checkpoint. Record
-only whether the configured route was used, each step succeeded or failed, and
-numeric usage/cache telemetry. For an agent-driven manual sequence, use the
-Herdr driver below.
+This is the Lite-off row: do not load `pi-openai-codex-compat` or another
+conversion provider, and do not set a Lite environment override. Stock Pi owns
+ordinary normal Responses; Ogul owns Remote Compaction V2 and its opaque
+checkpoint.
 
-## Pi compat Lite row
+Complete one normal turn, run manual `/compact`, then complete one normal
+follow-up. Record only whether the configured route was used, each step
+succeeded or failed, and numeric usage/cache telemetry. For an agent-driven
+manual sequence, use the Herdr driver below.
+
+## Pi compat Lite row (Lite on)
 
 Use a separate test root/session and the same explicit relay profile. Load the
 test-owned `pi-openai-codex-compat` extension and enable Lite explicitly:
@@ -121,29 +125,32 @@ pi --session-dir "$ROOT/sessions" \
 
 Complete the same normal → manual `/compact` → normal follow-up sequence.
 The package owns Lite construction, cache lineage, continuation, and Remote V2
-state; do not inspect their values. Record only the allowed result fields. For
-a controlled envelope comparison, run this same package in separate fresh
-sessions with `PI_OPENAI_CODEX_COMPAT_RESPONSES_LITE=on` and `=off`, using
-distinct long static prefixes to prevent cross-row reuse. The off row is not
-the Stock Pi + Ogul row; test that client separately.
+state; do not inspect their values. Record only the allowed result fields. The
+Lite-off comparison row is Stock Pi + Ogul above, not this package with Lite
+disabled.
 
-## Manual compaction driver
+## Manual compaction driver (Herdr)
 
-For an agent-driven manual `/compact` smoke, use Pi Herdr rather than a raw
-shell PTY driver:
+For an agent-driven manual `/compact` smoke, discover Herdr before starting
+Pi: call `tools.search({ query: "herdr" })`, then `tools.describe` the
+returned layout, agent, and pane tools. Use their discovered references and
+schemas; do not substitute a raw shell PTY driver.
 
-1. Create an isolated Herdr workspace/tab or pane with
-   `extensions.herdr_layout`.
-2. Start exactly one `kind: "pi"` agent in that new shell pane through
-   `extensions.herdr_agent`. Pass the isolated profile, session, model, and
-   one compaction extension through `agentArgs`; use a test-owned `@file`
-   for a large static corpus rather than putting it in a tool prompt.
-3. Wait for the normal turn to become idle, submit `/compact` with
-   `herdr_agent.prompt`, wait again, then submit the normal follow-up through
-   the same agent.
-4. Use lifecycle state plus structural/numeric session telemetry for the
+1. Create a fresh Herdr workspace/tab or shell pane with the discovered layout
+   tool.
+2. Start exactly one `kind: "pi"` agent in that new pane through the
+   discovered agent tool. Pass only the isolated profile, session, model, and
+   exactly one compaction extension through `agentArgs`; do not put the task
+   in `agentArgs`.
+3. Send the normal task with `herdr_agent.prompt` and wait for `idle` or
+   `done`. For a long cache prefix, keep the corpus in a test-owned file and
+   send only a short task that refers to it.
+4. Send `/compact` through the same agent tool after the normal task settles,
+   wait for it to settle, then send one normal follow-up through that same
+   agent.
+5. Use lifecycle state plus structural/numeric session telemetry for the
    verdict. Do not read the terminal transcript or request body. Close only
-   the pane created for the probe with `extensions.herdr_pane`.
+   the created pane with the discovered pane tool.
 
 ## Nanocodex and scope
 
