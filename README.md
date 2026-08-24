@@ -171,9 +171,23 @@ recording origin; it does not require a separate paid live run.
 Hermetic relay and image checks require no live credentials or services:
 
 ```bash
+cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release --target x86_64-unknown-linux-gnu
 ```
+
+### Git hooks
+
+Install [Lefthook](https://lefthook.dev/) once, then activate the repository hooks:
+
+```bash
+lefthook install
+```
+
+`pre-commit` verifies formatting. `pre-push` runs the hermetic test suite and
+Clippy with warnings denied. GitHub Actions repeats those checks and the Linux
+release build for every pull request.
 
 For the explicitly approved live acceptance matrix, start a separate temporary
 loopback bridge using a dedicated, test-owned managed-auth file and port. Do
