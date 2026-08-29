@@ -36,16 +36,24 @@ Images API.
 
 ## Build
 
-Build the single Linux release artifact on the target Linux host or approved
-Linux build environment:
+Build the single Linux `x86_64` release artifact on the target Linux host or
+approved Linux build environment:
 
 ```bash
 cargo build --release --target x86_64-unknown-linux-gnu
 # target/x86_64-unknown-linux-gnu/release/kepos-codex-bridge
 ```
 
-This repository deliberately adds no Docker image, container manifest, Helm
-chart, non-Linux target, or other platform package.
+The GitHub Actions workflow publishes the Linux `amd64` image on every push to
+`main`:
+
+```text
+ghcr.io/lamplitisles/kepos-codex-bridge:latest
+ghcr.io/lamplitisles/kepos-codex-bridge:sha-<commit>
+```
+
+The image runs as UID `10001`, includes CA certificates for the managed OAuth
+upstream, and has no container manifest, Helm chart, or non-Linux/amd64 build.
 
 ## Bridge-host setup and Kepos publication
 
