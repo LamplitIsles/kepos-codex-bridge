@@ -7,7 +7,7 @@ history, Lite rendering, cache lineage, continuations, tools, and compaction.
 
 ## Public contract
 
-The bridge publishes two fixed sibling routes:
+The bridge publishes three fixed sibling routes:
 
 - `POST /codex/responses` forwards an HTTP/SSE Responses request. It retains a
   4 MiB encoded request limit and streams the final upstream status, safe
@@ -19,6 +19,13 @@ The bridge publishes two fixed sibling routes:
   `{ "prompt": string, "images"?: string[] }`, a 32 MiB encoded limit, and
   exactly `{ "image_url": "data:image/png;base64,..." }`. A prompt alone
   generates; one through five `data:image/...` inputs edit.
+- `POST /hindsight/responses` is a narrow adapter for Hindsight's standard
+  non-streaming `openai-responses` provider. It retains the 4 MiB encoded
+  request limit, replaces peer identity with managed OAuth, forces the Codex
+  upstream request to stream, and returns one buffered `application/json`
+  Responses object. It removes `max_output_tokens`; when it does, the response
+  includes `x-kepos-ignored-parameters: max_output_tokens`. That limit is not
+  enforced before or after generation.
 
 Responses is JSON-opaque. The relay forwards client-controlled model,
 instructions, Lite/beta/cache/session/thread/request headers, continuation
@@ -29,10 +36,23 @@ the bridge's managed bearer/account identity. A pre-stream or pre-upgrade
 upstream 401 receives one managed-OAuth refresh retry. The relay never exposes
 upstream cookies or manufactures SSE events, Responses IDs, or protocol state.
 
+`/hindsight/responses` is intentionally the exception to the transparent
+relay's JSON-opaque contract. It preserves every compatible request field while
+performing only the two transport adaptations above. For a successful upstream
+SSE response, it buffers at most 4 MiB, rebuilds ordered `output` from
+`response.output_item.done` events, and combines it with the first terminal
+`response.completed`, `response.incomplete`, or `response.failed` object. It
+does not stream downstream, and it returns a generic 502 without partial data
+when the successful SSE stream is oversized, malformed, or lacks a terminal
+response. Non-successful upstream HTTP statuses and safe headers/bodies remain
+recognizable. Streaming or other Codex clients must continue to use
+`/codex/responses`.
+
 There is no `/v1` alias, `/compact` route, model alias, client-facing mode
-switch, or fixed `--model`/`--instructions` serve option. Model and instructions
-belong to the caller. `/codex/images` remains a fixed capability, not a generic
-Images API.
+switch, or fixed `--model`/`--instructions` serve option. In particular,
+`/hindsight/responses` is not a generic OpenAI Responses compatibility API.
+Model and instructions belong to the caller. `/codex/images` remains a fixed
+capability, not a generic Images API.
 
 ## Build
 
@@ -76,7 +96,7 @@ public keys authorized to use the bridge subscription:
 ```text
 service name: codex-bridge
 publisher target: http://127.0.0.1:8787
-paths: /codex/responses and /codex/images
+paths: /codex/responses, /codex/images, and /hindsight/responses
 transport: standard Kepos HTTP service (HTTP + WebSocket upgrade for Responses)
 allowlist: approved peer public keys
 ```
