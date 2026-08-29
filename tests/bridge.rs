@@ -518,13 +518,21 @@ async fn preserves_safe_non_successful_hindsight_upstream_responses() {
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let response = Client::new()
         .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
-        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "max_output_tokens": 37
+        }))
         .send()
         .await
         .expect("upstream failure response");
 
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(response.headers()["x-codex-turn-state"], "upstream-turn");
+    assert_eq!(
+        response.headers()["x-kepos-ignored-parameters"],
+        "max_output_tokens"
+    );
     assert!(!response.headers().contains_key("set-cookie"));
     assert_eq!(
         response.text().await.expect("upstream failure body"),

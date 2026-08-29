@@ -330,11 +330,18 @@ async fn hindsight_responses(
                 .into_response();
         }
     };
-    match bridge.forward_response(&uri, &headers, body).await {
-        Ok(upstream) if !upstream.status().is_success() => relay_response(upstream),
-        Ok(upstream) => adapt_hindsight_response(upstream, ignored_max_output_tokens).await,
-        Err(()) => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+    if ignored_max_output_tokens {
+        tracing::warn!(
+            route = HINDSIGHT_RESPONSES_ENDPOINT,
+            parameter = "max_output_tokens"
+        );
     }
+    let response = match bridge.forward_response(&uri, &headers, body).await {
+        Ok(upstream) if !upstream.status().is_success() => relay_response(upstream),
+        Ok(upstream) => adapt_hindsight_response(upstream).await,
+        Err(()) => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+    };
+    decorate_hindsight_response(response, ignored_max_output_tokens)
 }
 
 fn adapt_hindsight_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
@@ -348,10 +355,7 @@ fn adapt_hindsight_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
         .map_err(|_| ())
 }
 
-async fn adapt_hindsight_response(
-    upstream: reqwest::Response,
-    ignored_max_output_tokens: bool,
-) -> Response {
+async fn adapt_hindsight_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let mut headers = safe_response_headers(upstream.headers());
     let response = read_hindsight_response_stream(upstream).await;
@@ -372,12 +376,6 @@ async fn adapt_hindsight_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    if ignored_max_output_tokens {
-        headers.insert(
-            "x-kepos-ignored-parameters",
-            HeaderValue::from_static("max_output_tokens"),
-        );
-    }
     let mut downstream = HttpResponse::builder().status(status);
     downstream
         .headers_mut()
@@ -386,6 +384,19 @@ async fn adapt_hindsight_response(
     downstream
         .body(Body::from(response.to_string()))
         .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
+}
+
+fn decorate_hindsight_response(
+    mut response: Response,
+    ignored_max_output_tokens: bool,
+) -> Response {
+    if ignored_max_output_tokens {
+        response.headers_mut().insert(
+            "x-kepos-ignored-parameters",
+            HeaderValue::from_static("max_output_tokens"),
+        );
+    }
+    response
 }
 
 async fn read_hindsight_response_stream(upstream: reqwest::Response) -> Result<Value, ()> {
