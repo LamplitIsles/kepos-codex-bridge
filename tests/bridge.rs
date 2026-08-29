@@ -16,7 +16,7 @@ use axum::{
     routing::post,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
-use kepos_codex_bridge::{Bridge, ENDPOINT, IMAGE_ENDPOINT};
+use kepos_codex_bridge::{Bridge, ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT, IMAGE_ENDPOINT};
 use nanocodex_oai_api::{
     Model, OpenAi,
     auth::{
@@ -178,6 +178,73 @@ async fn start_recording_origin(
     (format!("http://{address}"), requests, task)
 }
 
+#[derive(Clone)]
+struct HindsightOrigin {
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    response_status: StatusCode,
+    response_chunks: Vec<Bytes>,
+}
+
+async fn hindsight_origin_responses(
+    State(state): State<HindsightOrigin>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_length = state
+        .response_chunks
+        .iter()
+        .map(Bytes::len)
+        .sum::<usize>()
+        .to_string();
+    state
+        .requests
+        .lock()
+        .await
+        .push(RecordedRequest { uri, headers, body });
+    Response::builder()
+        .status(state.response_status)
+        .header("content-type", "text/event-stream")
+        .header("content-length", content_length)
+        .header("x-codex-turn-state", "upstream-turn")
+        .header("set-cookie", "upstream-secret=never-forward")
+        .body(Body::from_stream(futures_util::stream::iter(
+            state.response_chunks.into_iter().map(Ok::<_, Infallible>),
+        )))
+        .expect("Hindsight origin response")
+}
+
+async fn start_hindsight_origin(
+    response_status: StatusCode,
+    response_chunks: Vec<Bytes>,
+) -> (
+    String,
+    Arc<Mutex<Vec<RecordedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("Hindsight origin listener");
+    let address = listener.local_addr().expect("Hindsight origin address");
+    let state = HindsightOrigin {
+        requests: requests.clone(),
+        response_status,
+        response_chunks,
+    };
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/responses", post(hindsight_origin_responses))
+                .with_state(state),
+        )
+        .await
+        .expect("Hindsight origin server");
+    });
+    (format!("http://{address}"), requests, task)
+}
+
 async fn start_bridge(
     auth: OpenAiAuth,
     responses_base: String,
@@ -264,6 +331,289 @@ async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
     }
     bridge_server.abort();
     origin_server.abort();
+}
+
+#[tokio::test]
+async fn adapts_hindsight_request_and_returns_a_buffered_response() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let request = json!({
+        "model": "gpt-5.4",
+        "input": [
+            {"role": "system", "content": "follow instructions"},
+            {"role": "user", "content": "hello"}
+        ],
+        "reasoning": {"effort": "medium"},
+        "text": {"format": {"type": "json_schema", "name": "result", "schema": {"type": "object"}}},
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "max_output_tokens": 37,
+        "stream": false
+    });
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .header("authorization", "Bearer peer-secret")
+        .header("cookie", "peer-cookie=secret")
+        .json(&request)
+        .send()
+        .await
+        .expect("adapted response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(
+        response.headers()["x-kepos-ignored-parameters"],
+        "max_output_tokens"
+    );
+    assert_eq!(
+        response.json::<Value>().await.expect("adapted JSON"),
+        json!({
+            "id": "normal-response",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "relay answer"}]
+            }],
+            "usage": null
+        })
+    );
+
+    let recorded = requests.lock().await.pop().expect("origin request");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&recorded.body).expect("rewritten JSON"),
+        json!({
+            "model": "gpt-5.4",
+            "input": [
+                {"role": "system", "content": "follow instructions"},
+                {"role": "user", "content": "hello"}
+            ],
+            "reasoning": {"effort": "medium"},
+            "text": {"format": {"type": "json_schema", "name": "result", "schema": {"type": "object"}}},
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "stream": true
+        })
+    );
+    assert_eq!(recorded.headers["authorization"], "Bearer managed-stale");
+    assert!(!recorded.headers.contains_key("cookie"));
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn aggregates_split_hindsight_sse_output_items_in_order() {
+    let sse = concat!(
+        "event: response.created\r\n",
+        "data: {\"type\":\"response.created\"}\r\n\r\n",
+        "event: opaque\r\n",
+        "data: response.completed\r\n\r\n",
+        "event: response.output_item.done\r\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{\\\"city\\\":\\\"Taipei\\\"}\"}}\r\n\r\n",
+        "event: response.output_item.done\r\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg-text\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\r\n\r\n",
+        "event: response.output_item.done\r\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg-json\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"answer\\\":42}\"}]}}\r\n\r\n",
+        "event: response.completed\r\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response-1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":12,\"output_tokens\":5},\"tools\":[{\"type\":\"function\",\"name\":\"lookup\"}]}}\r\n\r\n",
+        "data: [DONE]\r\n\r\n"
+    );
+    let upstream_content_length = sse.len().to_string();
+    let chunks = sse
+        .as_bytes()
+        .chunks(17)
+        .map(Bytes::copy_from_slice)
+        .collect();
+    let (origin, _, origin_server) = start_hindsight_origin(StatusCode::OK, chunks).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .json(&json!({"model": "gpt-5.4", "input": "hello", "stream": false}))
+        .send()
+        .await
+        .expect("aggregated response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    assert_eq!(response.headers()["x-codex-turn-state"], "upstream-turn");
+    assert_ne!(
+        response.headers()["content-length"],
+        upstream_content_length
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    assert!(
+        !response
+            .headers()
+            .contains_key("x-kepos-ignored-parameters")
+    );
+    assert_eq!(
+        response.json::<Value>().await.expect("aggregated JSON"),
+        json!({
+            "id": "response-1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {"type": "message", "id": "msg-text", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "message", "id": "msg-json", "role": "assistant", "content": [{"type": "output_text", "text": "{\"answer\":42}"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{\"city\":\"Taipei\"}"}
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 5},
+            "tools": [{"type": "function", "name": "lookup"}]
+        })
+    );
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn preserves_incomplete_and_failed_terminal_responses() {
+    for (event, response) in [
+        (
+            "response.incomplete",
+            json!({
+                "id": "incomplete-1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "id": "partial"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1}
+            }),
+        ),
+        (
+            "response.failed",
+            json!({
+                "id": "failed-1",
+                "status": "failed",
+                "error": {"code": "server_error", "message": "upstream failed"},
+                "output": [],
+                "usage": null
+            }),
+        ),
+    ] {
+        let body =
+            format!("event: {event}\ndata: {{\"type\":\"{event}\",\"response\":{response}}}\n\n");
+        let (origin, _, origin_server) =
+            start_hindsight_origin(StatusCode::OK, vec![Bytes::from(body)]).await;
+        let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+        let received = Client::new()
+            .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+            .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+            .send()
+            .await
+            .expect("terminal response");
+        assert_eq!(received.status(), StatusCode::OK);
+        assert_eq!(
+            received.json::<Value>().await.expect("terminal JSON"),
+            response
+        );
+        bridge_server.abort();
+        origin_server.abort();
+    }
+}
+
+#[tokio::test]
+async fn preserves_safe_non_successful_hindsight_upstream_responses() {
+    let (origin, _, origin_server) = start_hindsight_origin(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        vec![Bytes::from_static(b"upstream validation error")],
+    )
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .json(&json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "max_output_tokens": 37
+        }))
+        .send()
+        .await
+        .expect("upstream failure response");
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.headers()["x-codex-turn-state"], "upstream-turn");
+    assert_eq!(
+        response.headers()["x-kepos-ignored-parameters"],
+        "max_output_tokens"
+    );
+    assert!(!response.headers().contains_key("set-cookie"));
+    assert_eq!(
+        response.text().await.expect("upstream failure body"),
+        "upstream validation error"
+    );
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn retries_managed_auth_once_for_hindsight_requests() {
+    let (origin, requests, origin_server) = start_recording_origin(true, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .header("authorization", "Bearer peer-secret")
+        .json(&json!({"model": "gpt-5.4", "input": "hello"}))
+        .send()
+        .await
+        .expect("retried adapted response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("adapted JSON")["status"],
+        "completed"
+    );
+    let calls = requests.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].headers["authorization"], "Bearer managed-stale");
+    assert_eq!(calls[1].headers["authorization"], "Bearer managed-fresh");
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn keeps_the_existing_request_limit_for_hindsight_requests() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .json(&json!({"model": "gpt-5.4", "input": "x".repeat(4 * 1024 * 1024)}))
+        .send()
+        .await
+        .expect("limited response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(requests.lock().await.is_empty());
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn rejects_malformed_oversized_and_unterminated_hindsight_streams() {
+    let failures = [
+        vec![Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\"\n\n",
+        )],
+        vec![Bytes::from_static(
+            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\"\n\n",
+        )],
+        vec![Bytes::from_static(
+            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+        )],
+        vec![Bytes::from(vec![b'x'; 4 * 1024 * 1024 + 1])],
+    ];
+    for chunks in failures {
+        let (origin, _, origin_server) = start_hindsight_origin(StatusCode::OK, chunks).await;
+        let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+        let response = Client::new()
+            .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+            .json(&json!({"model": "gpt-5.4", "input": "do not expose this"}))
+            .send()
+            .await
+            .expect("adaptation failure response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.text().await.expect("generic failure body");
+        assert!(body.contains("upstream response adaptation failed"));
+        assert!(!body.contains("do not expose this"));
+        bridge_server.abort();
+        origin_server.abort();
+    }
 }
 
 #[tokio::test]

@@ -3,7 +3,7 @@
 //! The bridge owns only the ChatGPT OAuth credential. Responses request and
 //! response protocol state belongs entirely to the connected client.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -29,8 +29,10 @@ use tokio_tungstenite::{
 };
 
 pub const ENDPOINT: &str = "/codex/responses";
+pub const HINDSIGHT_RESPONSES_ENDPOINT: &str = "/hindsight/responses";
 pub const IMAGE_ENDPOINT: &str = "/codex/images";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HINDSIGHT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGE_MODEL: &str = "gpt-image-2";
@@ -86,6 +88,10 @@ impl Bridge {
                 post(http_responses)
                     .get(websocket_responses)
                     .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
+            )
+            .route(
+                HINDSIGHT_RESPONSES_ENDPOINT,
+                post(hindsight_responses).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
             .route(
                 IMAGE_ENDPOINT,
@@ -306,6 +312,212 @@ async fn http_responses(
         Ok(upstream) => relay_response(upstream),
         Err(()) => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
     }
+}
+
+async fn hindsight_responses(
+    State(bridge): State<Arc<Bridge>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (body, ignored_max_output_tokens) = match adapt_hindsight_request(&body) {
+        Ok(request) => request,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid Hindsight Responses request",
+            )
+                .into_response();
+        }
+    };
+    if ignored_max_output_tokens {
+        tracing::warn!(
+            route = HINDSIGHT_RESPONSES_ENDPOINT,
+            parameter = "max_output_tokens"
+        );
+    }
+    let response = match bridge.forward_response(&uri, &headers, body).await {
+        Ok(upstream) if !upstream.status().is_success() => relay_response(upstream),
+        Ok(upstream) => adapt_hindsight_response(upstream).await,
+        Err(()) => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
+    };
+    decorate_hindsight_response(response, ignored_max_output_tokens)
+}
+
+fn adapt_hindsight_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
+    let mut request: Value = serde_json::from_slice(raw).map_err(|_| ())?;
+    let request = request.as_object_mut().ok_or(())?;
+    let ignored_max_output_tokens = request.remove("max_output_tokens").is_some();
+    request.insert("stream".to_owned(), Value::Bool(true));
+    serde_json::to_vec(&request)
+        .map(Bytes::from)
+        .map(|body| (body, ignored_max_output_tokens))
+        .map_err(|_| ())
+}
+
+async fn adapt_hindsight_response(upstream: reqwest::Response) -> Response {
+    let status = upstream.status();
+    let mut headers = safe_response_headers(upstream.headers());
+    let response = read_hindsight_response_stream(upstream).await;
+    let response = match response {
+        Ok(response) => response,
+        Err(()) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "upstream response adaptation failed",
+            )
+                .into_response();
+        }
+    };
+    headers.remove(header::CONTENT_TYPE);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::CONTENT_ENCODING);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let mut downstream = HttpResponse::builder().status(status);
+    downstream
+        .headers_mut()
+        .expect("response builder headers")
+        .extend(headers);
+    downstream
+        .body(Body::from(response.to_string()))
+        .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
+}
+
+fn decorate_hindsight_response(
+    mut response: Response,
+    ignored_max_output_tokens: bool,
+) -> Response {
+    if ignored_max_output_tokens {
+        response.headers_mut().insert(
+            "x-kepos-ignored-parameters",
+            HeaderValue::from_static("max_output_tokens"),
+        );
+    }
+    response
+}
+
+async fn read_hindsight_response_stream(upstream: reqwest::Response) -> Result<Value, ()> {
+    let mut body = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ())?;
+        let length = body.len().checked_add(chunk.len()).ok_or(())?;
+        if length > MAX_HINDSIGHT_RESPONSE_BYTES {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    aggregate_hindsight_sse(&body)
+}
+
+fn aggregate_hindsight_sse(body: &[u8]) -> Result<Value, ()> {
+    let text = std::str::from_utf8(body).map_err(|_| ())?;
+    let normalized = text.replace("\r\n", "\n");
+    let mut output_items = BTreeMap::new();
+    let mut terminal = None;
+
+    for record in normalized.split("\n\n") {
+        let mut event_name = None;
+        let mut data = Vec::new();
+        for line in record.lines() {
+            if line.starts_with(':') {
+                continue;
+            }
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => event_name = Some(value),
+                "data" => data.push(value),
+                _ => {}
+            }
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let data = data.join("\n");
+        let named_type = event_name.filter(|name| is_hindsight_response_event(name));
+        if data.trim() == "[DONE]" {
+            if named_type.is_some() {
+                return Err(());
+            }
+            continue;
+        }
+        let parsed = serde_json::from_str::<Value>(&data);
+        let value = match parsed {
+            Ok(value) => value,
+            Err(_) if named_type.is_some() || looks_like_hindsight_response_payload(&data) => {
+                return Err(());
+            }
+            Err(_) => continue,
+        };
+        let data_type = value.get("type").and_then(Value::as_str);
+        let event_type = data_type
+            .filter(|name| is_hindsight_response_event(name))
+            .or(named_type);
+        let Some(event_type) = event_type else {
+            continue;
+        };
+        if named_type.is_some() && data_type != Some(event_type) {
+            return Err(());
+        }
+        match event_type {
+            "response.output_item.done" => {
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or(())?;
+                let item = value
+                    .get("item")
+                    .filter(|item| item.is_object())
+                    .cloned()
+                    .ok_or(())?;
+                output_items.insert(output_index, item);
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                let response = value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .cloned()
+                    .ok_or(())?;
+                terminal.get_or_insert(response);
+            }
+            _ => return Err(()),
+        }
+    }
+
+    let mut terminal = terminal.ok_or(())?;
+    if !output_items.is_empty() {
+        terminal["output"] = Value::Array(output_items.into_values().collect());
+    }
+    Ok(terminal)
+}
+
+fn is_hindsight_response_event(name: &str) -> bool {
+    matches!(
+        name,
+        "response.output_item.done"
+            | "response.completed"
+            | "response.incomplete"
+            | "response.failed"
+    )
+}
+
+fn looks_like_hindsight_response_payload(data: &str) -> bool {
+    let data = data.trim_start();
+    if !data.starts_with('{') || !data.contains("\"type\"") {
+        return false;
+    }
+    [
+        "response.output_item.done",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ]
+    .iter()
+    .any(|event| data.contains(event))
 }
 
 async fn websocket_responses(
