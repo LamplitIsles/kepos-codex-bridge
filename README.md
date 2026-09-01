@@ -7,7 +7,7 @@ history, Lite rendering, cache lineage, continuations, tools, and compaction.
 
 ## Public contract
 
-The bridge publishes three fixed sibling routes:
+The bridge publishes four fixed sibling routes:
 
 - `POST /codex/responses` forwards an HTTP/SSE Responses request. It retains a
   4 MiB encoded request limit and streams the final upstream status, safe
@@ -26,6 +26,27 @@ The bridge publishes three fixed sibling routes:
   Responses object. It removes `max_output_tokens`; when it does, the response
   includes `x-kepos-ignored-parameters: max_output_tokens`. That limit is not
   enforced before or after generation.
+- `POST /codex/web-search` is a stateless text-search adapter. It accepts only
+  `{ "commands": { ... } }` with one or more of `search_query` (one to three
+  queries), `weather`, `sports` (exactly one operation), `finance`, and `time`.
+  A search query is `{ "q": string, "recency"?: non-negative integer,
+  "domains"?: string[] }`; weather is `{ "location": string, "start"?:
+  "YYYY-MM-DD", "duration"?: positive integer }`; sports is one `{ "fn":
+  "schedule" | "standings", "league": "nba" | "wnba" | "nfl" | "nhl" |
+  "mlb" | "epl" | "ncaamb" | "ncaawb" | "ipl", ... }` (the bridge adds the
+  upstream-only `tool: "sports"` field); finance is `{ "ticker":
+  string, "type": "equity" | "fund" | "crypto" | "index", "market"?: string
+  }`; and time is `{ "utc_offset": "+HH:MM" | "-HH:MM" }`. Weather,
+  finance, and time arrays are capped at 16 entries. All user strings must be
+  non-blank, and dates/offsets must use their stated syntax. The bridge fixes
+  the upstream model, short response length, settings, and token budget,
+  supplies its managed OAuth identity, and rejects caller model, input, request
+  ID, response length, continuation, navigation, image-search, and other
+  stateful fields. The upstream `results` array is ordinary plaintext JSON and
+  is preserved as opaque values; encrypted `encrypted_output` continuation state
+  and all other upstream fields are removed. Requests and successful responses
+  are bounded at 64 KiB and 1 MiB, respectively, and failures are generic JSON
+  errors.
 
 Responses is JSON-opaque. The relay forwards client-controlled model,
 instructions, Lite/beta/cache/session/thread/request headers, continuation
@@ -96,7 +117,7 @@ public keys authorized to use the bridge subscription:
 ```text
 service name: codex-bridge
 publisher target: http://127.0.0.1:8787
-paths: /codex/responses, /codex/images, and /hindsight/responses
+paths: /codex/responses, /codex/images, /hindsight/responses, and /codex/web-search
 transport: standard Kepos HTTP service (HTTP + WebSocket upgrade for Responses)
 allowlist: approved peer public keys
 ```

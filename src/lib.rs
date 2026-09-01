@@ -3,7 +3,7 @@
 //! The bridge owns only the ChatGPT OAuth credential. Responses request and
 //! response protocol state belongs entirely to the connected client.
 
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, marker::PhantomData, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -15,11 +15,17 @@ use axum::{
     routing::post,
 };
 use futures_util::{SinkExt, StreamExt};
-use nanocodex_oai_api::auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot};
+use nanocodex_oai_api::{
+    MODEL as NANOCODEX_MODEL,
+    auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot},
+};
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::net::TcpStream;
+use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
+use serde_json::{Map, Value, json};
+use tokio::{
+    net::TcpStream,
+    time::{sleep, timeout},
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
@@ -27,16 +33,22 @@ use tokio_tungstenite::{
         protocol::CloseFrame as TungsteniteCloseFrame,
     },
 };
+use uuid::Uuid;
 
 pub const ENDPOINT: &str = "/codex/responses";
 pub const HINDSIGHT_RESPONSES_ENDPOINT: &str = "/hindsight/responses";
 pub const IMAGE_ENDPOINT: &str = "/codex/images";
+pub const WEB_SEARCH_ENDPOINT: &str = "/codex/web-search";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HINDSIGHT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_WEB_SEARCH_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGE_MODEL: &str = "gpt-image-2";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
+const WEB_SEARCH_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// A configured bridge endpoint.
 #[derive(Clone)]
@@ -44,6 +56,7 @@ pub struct Bridge {
     auth: OpenAiAuth,
     responses_client: reqwest::Client,
     image_client: reqwest::Client,
+    web_search_client: reqwest::Client,
     image_api_base_url: Arc<str>,
     responses_api_base_url: Arc<str>,
 }
@@ -60,6 +73,11 @@ impl Bridge {
                 .build()
                 .expect("Responses client configuration is valid"),
             image_client: reqwest::Client::new(),
+            web_search_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(WEB_SEARCH_TIMEOUT)
+                .build()
+                .expect("web search client configuration is valid"),
             image_api_base_url: base_url.clone(),
             responses_api_base_url: base_url,
         }
@@ -96,6 +114,10 @@ impl Bridge {
             .route(
                 IMAGE_ENDPOINT,
                 post(http_images).layer(DefaultBodyLimit::max(MAX_IMAGE_REQUEST_BYTES)),
+            )
+            .route(
+                WEB_SEARCH_ENDPOINT,
+                post(http_web_search).layer(DefaultBodyLimit::disable()),
             )
             .with_state(state)
     }
@@ -299,6 +321,114 @@ impl Bridge {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
         request.json(body).send().await.map_err(|_| ())
+    }
+
+    async fn perform_web_search(
+        &self,
+        commands: WebSearchCommands,
+    ) -> Result<WebSearchSuccess, WebSearchFailure> {
+        let id = Uuid::new_v4().to_string();
+        let body = encode_web_search_request(&commands, &id)?;
+        let endpoint = format!(
+            "{}/alpha/search",
+            self.responses_api_base_url.trim_end_matches('/')
+        );
+        match timeout(
+            WEB_SEARCH_TIMEOUT,
+            self.send_web_search_with_retries(&endpoint, body),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(WebSearchFailure::Timeout),
+        }
+    }
+
+    async fn send_web_search_with_retries(
+        &self,
+        endpoint: &str,
+        body: Bytes,
+    ) -> Result<WebSearchSuccess, WebSearchFailure> {
+        let mut auth_retried = false;
+        let mut transient_retried = false;
+
+        loop {
+            let auth = self
+                .auth
+                .snapshot()
+                .await
+                .map_err(|_| WebSearchFailure::Upstream)?;
+            let response = match self.send_web_search_request(endpoint, &body, &auth).await {
+                Ok(response) => response,
+                Err(()) if !transient_retried => {
+                    transient_retried = true;
+                    sleep(WEB_SEARCH_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(()) => return Err(WebSearchFailure::Upstream),
+            };
+
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && auth.mode() == OpenAiAuthMode::ChatGpt
+                && !auth_retried
+            {
+                auth_retried = true;
+                self.auth
+                    .recover_unauthorized(&auth)
+                    .await
+                    .map_err(|_| WebSearchFailure::Upstream)?;
+                continue;
+            }
+
+            if response.status().is_server_error() && !transient_retried {
+                transient_retried = true;
+                drop(response);
+                sleep(WEB_SEARCH_RETRY_DELAY).await;
+                continue;
+            }
+            if !response.status().is_success() {
+                drop(response);
+                return Err(WebSearchFailure::UpstreamStatus);
+            }
+
+            let body = match read_web_search_response(response).await {
+                Ok(body) => body,
+                Err(WebSearchReadFailure::Transport) if !transient_retried => {
+                    transient_retried = true;
+                    sleep(WEB_SEARCH_RETRY_DELAY).await;
+                    continue;
+                }
+                Err(WebSearchReadFailure::Transport) => {
+                    return Err(WebSearchFailure::Upstream);
+                }
+                Err(WebSearchReadFailure::Oversized) => {
+                    return Err(WebSearchFailure::MalformedResponse);
+                }
+            };
+            return decode_web_search_response(&body)
+                .map_err(|_| WebSearchFailure::MalformedResponse);
+        }
+    }
+
+    async fn send_web_search_request(
+        &self,
+        endpoint: &str,
+        body: &Bytes,
+        auth: &OpenAiAuthSnapshot,
+    ) -> Result<reqwest::Response, ()> {
+        let mut request = self
+            .web_search_client
+            .post(endpoint)
+            .header(USER_AGENT, NANOCODEX_USER_AGENT)
+            .header(AUTHORIZATION, format!("Bearer {}", auth.bearer()))
+            .header("content-type", "application/json");
+        if let Some(account_id) = auth.account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if auth.is_fedramp() {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+        request.body(body.clone()).send().await.map_err(|_| ())
     }
 }
 
@@ -818,6 +948,509 @@ async fn http_images(
         Ok(image_url) => axum::Json(json!({ "image_url": image_url })).into_response(),
         Err(()) => image_error(StatusCode::BAD_GATEWAY, "image operation failed"),
     }
+}
+
+async fn http_web_search(
+    State(bridge): State<Arc<Bridge>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_WEB_SEARCH_REQUEST_BYTES)
+    {
+        return web_search_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "web search request exceeded the 64 KiB limit",
+        );
+    }
+    let body = match read_web_search_request_body(body).await {
+        Ok(body) => body,
+        Err(WebSearchRequestReadFailure::Oversized) => {
+            return web_search_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "web search request exceeded the 64 KiB limit",
+            );
+        }
+        Err(WebSearchRequestReadFailure::Transport) => {
+            return web_search_error(StatusCode::BAD_REQUEST, "invalid web search request");
+        }
+    };
+    if body.len() > MAX_WEB_SEARCH_REQUEST_BYTES {
+        return web_search_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "web search request exceeded the 64 KiB limit",
+        );
+    }
+    let commands = match parse_web_search_request(&body) {
+        Ok(commands) => commands,
+        Err(()) => return web_search_error(StatusCode::BAD_REQUEST, "invalid web search request"),
+    };
+    match bridge.perform_web_search(commands).await {
+        Ok(result) => web_search_success(result),
+        Err(WebSearchFailure::RequestTooLarge) => web_search_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "web search request exceeded the 64 KiB limit",
+        ),
+        Err(WebSearchFailure::Timeout) => {
+            web_search_error(StatusCode::GATEWAY_TIMEOUT, "web search request timed out")
+        }
+        Err(_) => web_search_error(StatusCode::BAD_GATEWAY, "web search operation failed"),
+    }
+}
+
+fn web_search_success(result: WebSearchSuccess) -> Response {
+    let mut response = Map::new();
+    response.insert("output".to_owned(), Value::String(result.output));
+    if let Some(results) = result.results {
+        response.insert("results".to_owned(), Value::Array(results));
+    }
+    axum::Json(Value::Object(response)).into_response()
+}
+
+fn web_search_error(status: StatusCode, message: &'static str) -> Response {
+    let error_type = if status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE
+    {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    (
+        status,
+        axum::Json(json!({
+            "error": { "type": error_type, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchRequest {
+    commands: WebSearchCommands,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WebSearchCommands {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    search_query: Vec<SearchQuery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    weather: Vec<WeatherOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sports: Vec<SportsOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    finance: Vec<FinanceOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    time: Vec<TimeOperation>,
+}
+
+impl WebSearchCommands {
+    fn validate(&self) -> Result<(), ()> {
+        if self.search_query.is_empty()
+            && self.weather.is_empty()
+            && self.sports.is_empty()
+            && self.finance.is_empty()
+            && self.time.is_empty()
+        {
+            return Err(());
+        }
+        if self.search_query.len() > 3
+            || self.weather.len() > 16
+            || self.finance.len() > 16
+            || self.time.len() > 16
+            || self.sports.len() > 1
+        {
+            return Err(());
+        }
+        if self.search_query.iter().any(|query| {
+            !is_non_empty(&query.q)
+                || query
+                    .domains
+                    .as_ref()
+                    .is_some_and(|domains| domains.iter().any(|domain| !is_non_empty(domain)))
+        }) {
+            return Err(());
+        }
+        if self.weather.iter().any(|operation| {
+            !is_non_empty(&operation.location)
+                || operation
+                    .start
+                    .as_deref()
+                    .is_some_and(|date| !is_valid_date(date))
+                || operation.duration.is_some_and(|duration| duration == 0)
+        }) {
+            return Err(());
+        }
+        if self.sports.iter().any(|operation| {
+            operation
+                .team
+                .as_deref()
+                .is_some_and(|team| !is_non_empty(team))
+                || operation
+                    .opponent
+                    .as_deref()
+                    .is_some_and(|opponent| !is_non_empty(opponent))
+                || operation
+                    .date_from
+                    .as_deref()
+                    .is_some_and(|date| !is_valid_date(date))
+                || operation
+                    .date_to
+                    .as_deref()
+                    .is_some_and(|date| !is_valid_date(date))
+                || operation.num_games.is_some_and(|num_games| num_games == 0)
+                || operation
+                    .locale
+                    .as_deref()
+                    .is_some_and(|locale| !is_non_empty(locale))
+        }) {
+            return Err(());
+        }
+        if self.finance.iter().any(|operation| {
+            !is_non_empty(&operation.ticker)
+                || operation
+                    .market
+                    .as_deref()
+                    .is_some_and(|market| !is_non_empty(market))
+        }) {
+            return Err(());
+        }
+        if self
+            .time
+            .iter()
+            .any(|operation| !is_valid_utc_offset(&operation.utc_offset))
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SearchQuery {
+    q: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    recency: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WeatherOperation {
+    location: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    start: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    duration: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SportsOperation {
+    r#fn: SportsFunction,
+    league: SportsLeague,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    team: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    opponent: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    date_from: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    date_to: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    num_games: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    locale: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SportsFunction {
+    Schedule,
+    Standings,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SportsLeague {
+    Nba,
+    Wnba,
+    Nfl,
+    Nhl,
+    Mlb,
+    Epl,
+    Ncaamb,
+    Ncaawb,
+    Ipl,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FinanceOperation {
+    ticker: String,
+    r#type: FinanceAssetType,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    market: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FinanceAssetType {
+    Equity,
+    Fund,
+    Crypto,
+    Index,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TimeOperation {
+    utc_offset: String,
+}
+
+#[derive(Debug)]
+struct WebSearchSuccess {
+    output: String,
+    results: Option<Vec<Value>>,
+}
+
+#[derive(Debug)]
+enum WebSearchFailure {
+    RequestTooLarge,
+    Timeout,
+    Upstream,
+    UpstreamStatus,
+    MalformedResponse,
+}
+
+#[derive(Debug)]
+enum WebSearchReadFailure {
+    Transport,
+    Oversized,
+}
+
+#[derive(Debug)]
+enum WebSearchRequestReadFailure {
+    Transport,
+    Oversized,
+}
+
+fn parse_web_search_request(raw: &[u8]) -> Result<WebSearchCommands, ()> {
+    let request: WebSearchRequest = serde_json::from_slice(raw).map_err(|_| ())?;
+    request.commands.validate()?;
+    Ok(request.commands)
+}
+
+async fn read_web_search_request_body(body: Body) -> Result<Bytes, WebSearchRequestReadFailure> {
+    let mut body_bytes = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| WebSearchRequestReadFailure::Transport)?;
+        let length = body_bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(WebSearchRequestReadFailure::Oversized)?;
+        if length > MAX_WEB_SEARCH_REQUEST_BYTES {
+            return Err(WebSearchRequestReadFailure::Oversized);
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body_bytes))
+}
+
+fn encode_web_search_request(
+    commands: &WebSearchCommands,
+    id: &str,
+) -> Result<Bytes, WebSearchFailure> {
+    let mut commands = serde_json::to_value(commands).map_err(|_| WebSearchFailure::Upstream)?;
+    let commands = commands.as_object_mut().ok_or(WebSearchFailure::Upstream)?;
+    commands.insert(
+        "response_length".to_owned(),
+        Value::String("short".to_owned()),
+    );
+    if let Some(Value::Array(operations)) = commands.get_mut("sports") {
+        for operation in operations {
+            let operation = operation
+                .as_object_mut()
+                .ok_or(WebSearchFailure::Upstream)?;
+            operation.insert("tool".to_owned(), Value::String("sports".to_owned()));
+        }
+    }
+    let envelope = json!({
+        "id": id,
+        "model": NANOCODEX_MODEL,
+        "commands": Value::Object(commands.clone()),
+        "settings": { "allowed_callers": ["direct"], "external_web_access": true },
+        "max_output_tokens": 10_000,
+    });
+    let body = serde_json::to_vec(&envelope).map_err(|_| WebSearchFailure::Upstream)?;
+    if body.len() > MAX_WEB_SEARCH_REQUEST_BYTES {
+        return Err(WebSearchFailure::RequestTooLarge);
+    }
+    Ok(Bytes::from(body))
+}
+
+async fn read_web_search_response(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, WebSearchReadFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEB_SEARCH_RESPONSE_BYTES as u64)
+    {
+        return Err(WebSearchReadFailure::Oversized);
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| WebSearchReadFailure::Transport)?;
+        let length = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(WebSearchReadFailure::Oversized)?;
+        if length > MAX_WEB_SEARCH_RESPONSE_BYTES {
+            return Err(WebSearchReadFailure::Oversized);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn decode_web_search_response(raw: &[u8]) -> Result<WebSearchSuccess, ()> {
+    let payload: Value = serde_json::from_slice(raw).map_err(|_| ())?;
+    let object = payload.as_object().ok_or(())?;
+    let output = object.get("output").and_then(Value::as_str).ok_or(())?;
+    let results = match object.get("results") {
+        None => None,
+        Some(Value::Array(results)) => Some(results.clone()),
+        Some(_) => return Err(()),
+    };
+    Ok(WebSearchSuccess {
+        output: output.to_owned(),
+        results,
+    })
+}
+
+fn is_non_empty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn is_valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = value[5..7].parse::<u8>().ok();
+    let day = value[8..10].parse::<u8>().ok();
+    month.is_some_and(|month| (1..=12).contains(&month))
+        && day.is_some_and(|day| (1..=31).contains(&day))
+}
+
+fn is_valid_utc_offset(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
+        return false;
+    }
+    if !bytes[1..3]
+        .iter()
+        .chain(&bytes[4..6])
+        .all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    let hours = value[1..3].parse::<u8>().ok();
+    let minutes = value[4..6].parse::<u8>().ok();
+    hours.is_some_and(|hours| hours <= 23) && minutes.is_some_and(|minutes| minutes <= 59)
+}
+
+fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct NonNullOptionVisitor<T>(PhantomData<T>);
+
+    impl<'de, T> Visitor<'de> for NonNullOptionVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Option<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a non-null optional value")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::custom("null is not allowed"))
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            T::deserialize(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(NonNullOptionVisitor(PhantomData))
 }
 
 async fn shutdown_signal() {
