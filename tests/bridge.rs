@@ -340,6 +340,69 @@ async fn start_search_origin(
     (format!("http://{address}"), requests, task)
 }
 
+#[derive(Clone)]
+struct SequencedSearchOrigin {
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    responses: Arc<Mutex<Vec<(StatusCode, Bytes)>>>,
+}
+
+async fn sequenced_search_origin_response(
+    State(state): State<SequencedSearchOrigin>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state
+        .requests
+        .lock()
+        .await
+        .push(RecordedRequest { uri, headers, body });
+    let (status, response_body) = {
+        let mut responses = state.responses.lock().await;
+        if responses.len() > 1 {
+            responses.remove(0)
+        } else {
+            responses.pop().expect("sequenced search response fixture")
+        }
+    };
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(response_body))
+        .expect("sequenced search response")
+}
+
+async fn start_sequenced_search_origin(
+    responses: Vec<(StatusCode, Bytes)>,
+) -> (
+    String,
+    Arc<Mutex<Vec<RecordedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = SequencedSearchOrigin {
+        requests: requests.clone(),
+        responses: Arc::new(Mutex::new(responses)),
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("sequenced search origin listener");
+    let address = listener
+        .local_addr()
+        .expect("sequenced search origin address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/alpha/search", post(sequenced_search_origin_response))
+                .with_state(state),
+        )
+        .await
+        .expect("sequenced search origin");
+    });
+    (format!("http://{address}"), requests, task)
+}
+
 #[tokio::test]
 async fn stateless_web_search_uses_fixed_envelope_and_preserves_plaintext_results() {
     let upstream_body = json!({
@@ -443,8 +506,14 @@ async fn stateless_web_search_rejects_invalid_requests_without_upstream_contact(
         json!({"commands": {"weather": [{"location": "Taipei", "duration": null}]}}),
         json!({"commands": {"time": [{"utc_offset": "+8:00"}]}}),
         json!({"commands": {"open": [{"ref_id": "turn0search0"}]}}),
+        json!({"commands": {"find": [{"ref_id": "turn0search0", "pattern": "secret"}]}}),
+        json!({"commands": {"click": [{"ref_id": "turn0search0", "id": 1}]}}),
+        json!({"commands": {"image_query": [{"q": "cats"}]}}),
         json!({"commands": {"search_query": [{"q": "one"}], "response_length": "long"}}),
         json!({"commands": {"search_query": [{"q": "one"}]}, "model": "caller-model"}),
+        json!({"commands": {"search_query": [{"q": "one"}]}, "id": "caller-id"}),
+        json!({"commands": {"search_query": [{"q": "one"}]}, "input": "caller-input"}),
+        json!({"commands": {"search_query": [{"q": "one", "nested": "rejected"}]}}),
     ];
     for body in invalid {
         let response = Client::new()
@@ -511,6 +580,68 @@ async fn stateless_web_search_returns_generic_error_for_unsafe_upstream_data() {
     assert!(body.contains("web search operation failed"));
     assert!(!body.contains('x'));
     assert_eq!(requests.lock().await.len(), 1);
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn stateless_web_search_hides_malformed_or_missing_output_fixtures() {
+    let fixtures = [
+        (
+            "malformed-output-secret",
+            Bytes::from_static(br#"{"output":"malformed-output-secret""#),
+        ),
+        (
+            "missing-output-secret",
+            Bytes::from_static(br#"{"results":[{"secret":"missing-output-secret"}]}"#),
+        ),
+    ];
+    for (secret, response_body) in fixtures {
+        let (origin, requests, origin_server) =
+            start_search_origin(StatusCode::OK, response_body, false).await;
+        let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+        let response = Client::new()
+            .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+            .json(&json!({"commands": {"search_query": [{"q": "malformed"}]}}))
+            .send()
+            .await
+            .expect("malformed search response");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response
+            .json::<Value>()
+            .await
+            .expect("malformed error JSON");
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "web search operation failed");
+        assert!(!body.to_string().contains(secret));
+        assert_eq!(requests.lock().await.len(), 1);
+        bridge_server.abort();
+        origin_server.abort();
+    }
+}
+
+#[tokio::test]
+async fn stateless_web_search_retries_one_5xx_and_hides_error_body() {
+    let secret = "upstream-5xx-secret";
+    let fixture = Bytes::from(format!(r#"{{"error":"{secret}"}}"#));
+    let (origin, requests, origin_server) = start_sequenced_search_origin(vec![
+        (StatusCode::INTERNAL_SERVER_ERROR, fixture.clone()),
+        (StatusCode::INTERNAL_SERVER_ERROR, fixture),
+    ])
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+        .json(&json!({"commands": {"search_query": [{"q": "retry"}]}}))
+        .send()
+        .await
+        .expect("5xx search response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.json::<Value>().await.expect("5xx error JSON");
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(body["error"]["message"], "web search operation failed");
+    assert!(!body.to_string().contains(secret));
+    assert_eq!(requests.lock().await.len(), 2);
     bridge_server.abort();
     origin_server.abort();
 }

@@ -15,7 +15,10 @@ use axum::{
     routing::post,
 };
 use futures_util::{SinkExt, StreamExt};
-use nanocodex_oai_api::auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot};
+use nanocodex_oai_api::{
+    MODEL as NANOCODEX_MODEL,
+    auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot},
+};
 use reqwest::header::{AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use serde_json::{Map, Value, json};
@@ -44,7 +47,6 @@ const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGE_MODEL: &str = "gpt-image-2";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
-const WEB_SEARCH_MODEL: &str = "gpt-5.6-sol";
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const WEB_SEARCH_RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -1325,7 +1327,7 @@ fn encode_web_search_request(
     }
     let envelope = json!({
         "id": id,
-        "model": WEB_SEARCH_MODEL,
+        "model": NANOCODEX_MODEL,
         "commands": Value::Object(commands.clone()),
         "settings": { "allowed_callers": ["direct"], "external_web_access": true },
         "max_output_tokens": 10_000,
