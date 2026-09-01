@@ -49,9 +49,10 @@ async fn serve(auth_file: PathBuf, port: u16) -> Result<(), Box<dyn std::error::
     let bridge = Bridge::new(auth);
     let (listener, address) = bind_loopback(port).await?;
     eprintln!(
-        "Kepos Codex bridge listening on http://{address}{responses} and http://{address}{images}",
+        "Kepos Codex bridge listening on http://{address}{responses}, http://{address}{images}, and http://{address}{web_search}",
         responses = kepos_codex_bridge::ENDPOINT,
         images = kepos_codex_bridge::IMAGE_ENDPOINT,
+        web_search = kepos_codex_bridge::WEB_SEARCH_ENDPOINT,
     );
     bridge.serve(listener).await?;
     Ok(())

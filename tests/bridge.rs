@@ -16,7 +16,9 @@ use axum::{
     routing::post,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
-use kepos_codex_bridge::{Bridge, ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT, IMAGE_ENDPOINT};
+use kepos_codex_bridge::{
+    Bridge, ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT, IMAGE_ENDPOINT, WEB_SEARCH_ENDPOINT,
+};
 use nanocodex_oai_api::{
     Model, OpenAi,
     auth::{
@@ -266,6 +268,277 @@ async fn start_bridge(
             .expect("bridge server");
     });
     (format!("http://{address}{ENDPOINT}"), task)
+}
+
+#[derive(Clone)]
+struct SearchOrigin {
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    response_status: StatusCode,
+    response_body: Bytes,
+    unauthorized_stale: bool,
+}
+
+async fn search_origin_response(
+    State(state): State<SearchOrigin>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.requests.lock().await.push(RecordedRequest {
+        uri,
+        headers: headers.clone(),
+        body,
+    });
+    if state.unauthorized_stale
+        && headers
+            .get("authorization")
+            .is_some_and(|value| value == "Bearer managed-stale")
+    {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "text/plain")
+            .body(Body::from("secret unauthorized detail"))
+            .expect("search 401 response");
+    }
+    Response::builder()
+        .status(state.response_status)
+        .header("content-type", "application/json")
+        .body(Body::from(state.response_body))
+        .expect("search response")
+}
+
+async fn start_search_origin(
+    response_status: StatusCode,
+    response_body: Bytes,
+    unauthorized_stale: bool,
+) -> (
+    String,
+    Arc<Mutex<Vec<RecordedRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let state = SearchOrigin {
+        requests: requests.clone(),
+        response_status,
+        response_body,
+        unauthorized_stale,
+    };
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("search origin listener");
+    let address = listener.local_addr().expect("search origin address");
+    let task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/alpha/search", post(search_origin_response))
+                .with_state(state),
+        )
+        .await
+        .expect("search origin");
+    });
+    (format!("http://{address}"), requests, task)
+}
+
+#[tokio::test]
+async fn stateless_web_search_uses_fixed_envelope_and_preserves_plaintext_results() {
+    let upstream_body = json!({
+        "output": "The answer",
+        "results": [{
+            "type": "text_result",
+            "nested": {"unknown": [1, true, null]},
+            "future_field": "preserve me"
+        }],
+        "encrypted_output": "do-not-forward",
+        "other_upstream_state": {"secret": true}
+    });
+    let (origin, requests, origin_server) = start_search_origin(
+        StatusCode::OK,
+        Bytes::from(serde_json::to_vec(&upstream_body).expect("search fixture")),
+        false,
+    )
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin.clone(), None).await;
+    let request_body = json!({
+        "commands": {
+            "search_query": [
+                {"q": "  rust async  ", "recency": 0, "domains": ["example.com"]}
+            ],
+            "weather": [{"location": "Taipei", "start": "2026-09-01", "duration": 1}],
+            "sports": [{"fn": "schedule", "league": "nba", "team": "GSW"}],
+            "finance": [{"ticker": "ACME", "type": "equity", "market": "USA"}],
+            "time": [{"utc_offset": "+08:00"}]
+        }
+    });
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+        .header("authorization", "Bearer peer-secret")
+        .header("cookie", "peer-cookie=secret")
+        .header("chatgpt-account-id", "peer-account")
+        .header("x-openai-fedramp", "false")
+        .json(&request_body)
+        .send()
+        .await
+        .expect("web search response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("search JSON"),
+        upstream_body["output"]
+            .as_str()
+            .map(|output| {
+                json!({
+                    "output": output,
+                    "results": upstream_body["results"].clone()
+                })
+            })
+            .expect("output fixture")
+    );
+
+    let request = requests.lock().await.pop().expect("search origin request");
+    assert_eq!(request.uri.path(), "/alpha/search");
+    assert_eq!(request.headers["authorization"], "Bearer managed-stale");
+    assert_eq!(request.headers["chatgpt-account-id"], "managed-account");
+    assert_eq!(request.headers["x-openai-fedramp"], "true");
+    assert_eq!(request.headers["user-agent"], "nanocodex/0.5.0");
+    assert_eq!(request.headers["content-type"], "application/json");
+    let encoded: Value = serde_json::from_slice(&request.body).expect("upstream request JSON");
+    assert!(encoded["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(encoded["model"], "gpt-5.6-sol");
+    assert_eq!(encoded["commands"]["response_length"], "short");
+    assert_eq!(encoded["commands"]["sports"][0]["tool"], "sports");
+    assert_eq!(
+        encoded["settings"],
+        json!({
+            "allowed_callers": ["direct"],
+            "external_web_access": true
+        })
+    );
+    assert_eq!(encoded["max_output_tokens"], 10_000);
+    assert!(encoded.get("input").is_none());
+    assert!(
+        request
+            .body
+            .windows(b"peer-secret".len())
+            .all(|window| window != b"peer-secret")
+    );
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn stateless_web_search_rejects_invalid_requests_without_upstream_contact() {
+    let (origin, requests, origin_server) = start_search_origin(
+        StatusCode::OK,
+        Bytes::from_static(br#"{"output":"unused"}"#),
+        false,
+    )
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let invalid = [
+        json!({"commands": {}}),
+        json!({"commands": {"search_query": [{"q": ""}]}}),
+        json!({"commands": {"search_query": [{"q": "one"}, {"q": "two"}, {"q": "three"}, {"q": "four"}]}}),
+        json!({"commands": {"sports": [{"fn": "schedule", "league": "nba"}, {"fn": "standings", "league": "nfl"}]}}),
+        json!({"commands": {"weather": [{"location": "Taipei", "start": "2026-2-30"}]}}),
+        json!({"commands": {"weather": [{"location": "Taipei", "duration": null}]}}),
+        json!({"commands": {"time": [{"utc_offset": "+8:00"}]}}),
+        json!({"commands": {"open": [{"ref_id": "turn0search0"}]}}),
+        json!({"commands": {"search_query": [{"q": "one"}], "response_length": "long"}}),
+        json!({"commands": {"search_query": [{"q": "one"}]}, "model": "caller-model"}),
+    ];
+    for body in invalid {
+        let response = Client::new()
+            .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+            .json(&body)
+            .send()
+            .await
+            .expect("validation response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = response.json::<Value>().await.expect("validation JSON");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+    }
+    assert!(requests.lock().await.is_empty());
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn stateless_web_search_recovers_managed_401_once() {
+    let (origin, requests, origin_server) = start_search_origin(
+        StatusCode::OK,
+        Bytes::from_static(br#"{"output":"fresh"}"#),
+        true,
+    )
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+        .json(&json!({"commands": {"search_query": [{"q": "recover"}]}}))
+        .send()
+        .await
+        .expect("recovered search response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.expect("search JSON"),
+        json!({"output": "fresh"})
+    );
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].headers["authorization"], "Bearer managed-stale");
+    assert_eq!(requests[1].headers["authorization"], "Bearer managed-fresh");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[0].body).expect("first request JSON")["id"],
+        serde_json::from_slice::<Value>(&requests[1].body).expect("second request JSON")["id"]
+    );
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn stateless_web_search_returns_generic_error_for_unsafe_upstream_data() {
+    let oversized = Bytes::from(vec![b'x'; 1024 * 1024 + 1]);
+    let (origin, requests, origin_server) =
+        start_search_origin(StatusCode::OK, oversized, false).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+        .json(&json!({"commands": {"time": [{"utc_offset": "+00:00"}]}}))
+        .send()
+        .await
+        .expect("oversized search response");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("error body");
+    assert!(body.contains("web search operation failed"));
+    assert!(!body.contains('x'));
+    assert_eq!(requests.lock().await.len(), 1);
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn stateless_web_search_rejects_oversized_requests_before_upstream_contact() {
+    let (origin, requests, origin_server) = start_search_origin(
+        StatusCode::OK,
+        Bytes::from_static(br#"{"output":"unused"}"#),
+        false,
+    )
+    .await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let response = Client::new()
+        .post(url.replace(ENDPOINT, WEB_SEARCH_ENDPOINT))
+        .header("content-type", "application/json")
+        .body(vec![b' '; 64 * 1024 + 1])
+        .send()
+        .await
+        .expect("oversized request response");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response.json::<Value>().await.expect("oversized JSON")["error"]["type"],
+        "invalid_request_error"
+    );
+    assert!(requests.lock().await.is_empty());
+    bridge_server.abort();
+    origin_server.abort();
 }
 
 #[tokio::test]
