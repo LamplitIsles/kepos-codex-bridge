@@ -742,7 +742,7 @@ async fn adapts_luna_buffered_request_and_returns_a_buffered_response() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let request = json!({
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-luna",
         "input": [
             {"role": "system", "content": "follow instructions"},
             {"role": "user", "content": "hello"}
@@ -785,7 +785,7 @@ async fn adapts_luna_buffered_request_and_returns_a_buffered_response() {
     assert_eq!(
         serde_json::from_slice::<Value>(&recorded.body).expect("rewritten JSON"),
         json!({
-            "model": "gpt-5.6-sol",
+            "model": "gpt-5.6-luna",
             "input": [
                 {"role": "system", "content": "follow instructions"},
                 {"role": "user", "content": "hello"}
