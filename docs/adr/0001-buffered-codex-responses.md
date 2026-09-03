@@ -15,7 +15,7 @@ documentation bind that transport conversion to one consumer.
 
 ## Decision
 
-Replace the former consumer-specific route with `POST /codex/buffered-responses`.
+Replace the former consumer-specific route with `POST /codex/buffered/responses`.
 
 The endpoint accepts one JSON-object request without tools,
 `previous_response_id`, or `stream: true`, makes the upstream request stream,

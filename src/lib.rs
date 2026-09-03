@@ -36,7 +36,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 pub const ENDPOINT: &str = "/codex/responses";
-pub const BUFFERED_RESPONSES_ENDPOINT: &str = "/codex/buffered-responses";
+pub const BUFFERED_RESPONSES_ENDPOINT: &str = "/codex/buffered/responses";
 pub const IMAGE_ENDPOINT: &str = "/codex/images";
 pub const WEB_SEARCH_ENDPOINT: &str = "/codex/web-search";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;

@@ -1132,7 +1132,11 @@ async fn unsupported_route_remains_absent() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let client = Client::new();
-    for path in ["/codex/unsupported", "/hindsight/responses"] {
+    for path in [
+        "/codex/unsupported",
+        "/hindsight/responses",
+        "/codex/buffered-responses",
+    ] {
         let response = client
             .post(url.replace(ENDPOINT, path))
             .send()
