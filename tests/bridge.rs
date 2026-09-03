@@ -17,7 +17,7 @@ use axum::{
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use kepos_codex_bridge::{
-    Bridge, ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT, IMAGE_ENDPOINT, WEB_SEARCH_ENDPOINT,
+    BUFFERED_RESPONSES_ENDPOINT, Bridge, ENDPOINT, IMAGE_ENDPOINT, WEB_SEARCH_ENDPOINT,
 };
 use nanocodex_oai_api::{
     Model, OpenAi,
@@ -181,14 +181,14 @@ async fn start_recording_origin(
 }
 
 #[derive(Clone)]
-struct HindsightOrigin {
+struct BufferedOrigin {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     response_status: StatusCode,
     response_chunks: Vec<Bytes>,
 }
 
-async fn hindsight_origin_responses(
-    State(state): State<HindsightOrigin>,
+async fn buffered_origin_responses(
+    State(state): State<BufferedOrigin>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -213,10 +213,10 @@ async fn hindsight_origin_responses(
         .body(Body::from_stream(futures_util::stream::iter(
             state.response_chunks.into_iter().map(Ok::<_, Infallible>),
         )))
-        .expect("Hindsight origin response")
+        .expect("buffered origin response")
 }
 
-async fn start_hindsight_origin(
+async fn start_buffered_origin(
     response_status: StatusCode,
     response_chunks: Vec<Bytes>,
 ) -> (
@@ -227,9 +227,9 @@ async fn start_hindsight_origin(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
-        .expect("Hindsight origin listener");
-    let address = listener.local_addr().expect("Hindsight origin address");
-    let state = HindsightOrigin {
+        .expect("buffered origin listener");
+    let address = listener.local_addr().expect("buffered origin address");
+    let state = BufferedOrigin {
         requests: requests.clone(),
         response_status,
         response_chunks,
@@ -238,11 +238,11 @@ async fn start_hindsight_origin(
         axum::serve(
             listener,
             axum::Router::new()
-                .route("/responses", post(hindsight_origin_responses))
+                .route("/responses", post(buffered_origin_responses))
                 .with_state(state),
         )
         .await
-        .expect("Hindsight origin server");
+        .expect("buffered origin server");
     });
     (format!("http://{address}"), requests, task)
 }
@@ -738,23 +738,22 @@ async fn relays_zstd_bytes_client_protocol_and_sse_without_parsing() {
 }
 
 #[tokio::test]
-async fn adapts_hindsight_request_and_returns_a_buffered_response() {
+async fn adapts_luna_buffered_request_and_returns_a_buffered_response() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let request = json!({
-        "model": "gpt-5.4",
+        "model": "gpt-5.6-luna",
         "input": [
             {"role": "system", "content": "follow instructions"},
             {"role": "user", "content": "hello"}
         ],
-        "reasoning": {"effort": "medium"},
+        "reasoning": {"effort": "medium", "summary": "auto"},
         "text": {"format": {"type": "json_schema", "name": "result", "schema": {"type": "object"}}},
-        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
         "max_output_tokens": 37,
         "stream": false
     });
     let response = Client::new()
-        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
         .header("authorization", "Bearer peer-secret")
         .header("cookie", "peer-cookie=secret")
         .json(&request)
@@ -786,14 +785,13 @@ async fn adapts_hindsight_request_and_returns_a_buffered_response() {
     assert_eq!(
         serde_json::from_slice::<Value>(&recorded.body).expect("rewritten JSON"),
         json!({
-            "model": "gpt-5.4",
+            "model": "gpt-5.6-luna",
             "input": [
                 {"role": "system", "content": "follow instructions"},
                 {"role": "user", "content": "hello"}
             ],
-            "reasoning": {"effort": "medium"},
+            "reasoning": {"effort": "medium", "summary": "auto"},
             "text": {"format": {"type": "json_schema", "name": "result", "schema": {"type": "object"}}},
-            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
             "stream": true
         })
     );
@@ -804,7 +802,94 @@ async fn adapts_hindsight_request_and_returns_a_buffered_response() {
 }
 
 #[tokio::test]
-async fn aggregates_split_hindsight_sse_output_items_in_order() {
+async fn normalizes_spark_reasoning_without_leaving_empty_reasoning() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let client = Client::new();
+
+    for request in [
+        json!({
+            "model": "gpt-5.3-codex-spark",
+            "input": "summary only",
+            "reasoning": {"summary": "auto"},
+            "stream": false
+        }),
+        json!({
+            "model": "gpt-5.3-codex-spark",
+            "input": "effort and summary",
+            "reasoning": {"effort": "medium", "summary": "auto"}
+        }),
+    ] {
+        let response = client
+            .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
+            .json(&request)
+            .send()
+            .await
+            .expect("Spark buffered response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert!(
+            !response
+                .headers()
+                .contains_key("x-kepos-ignored-parameters")
+        );
+    }
+
+    let calls = requests.lock().await;
+    assert_eq!(calls.len(), 2);
+    let first: Value = serde_json::from_slice(&calls[0].body).expect("first Spark request JSON");
+    assert_eq!(first["model"], "gpt-5.3-codex-spark");
+    assert_eq!(first["input"], "summary only");
+    assert_eq!(first["stream"], true);
+    assert!(first.get("reasoning").is_none());
+    let second: Value = serde_json::from_slice(&calls[1].body).expect("second Spark request JSON");
+    assert_eq!(second["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(second["stream"], true);
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn rejects_tools_continuation_and_caller_streaming_before_forwarding() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let client = Client::new();
+    for request in [
+        json!({
+            "model": "gpt-5.6-sol",
+            "input": "tool request",
+            "tools": [{"type": "function", "name": "lookup"}]
+        }),
+        json!({
+            "model": "gpt-5.6-sol",
+            "input": "continuation request",
+            "previous_response_id": "resp-1"
+        }),
+        json!({
+            "model": "gpt-5.6-sol",
+            "input": "streaming request",
+            "stream": true
+        }),
+    ] {
+        let response = client
+            .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
+            .json(&request)
+            .send()
+            .await
+            .expect("invalid buffered response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.text().await.expect("invalid request body"),
+            "invalid buffered Responses request"
+        );
+    }
+    assert!(requests.lock().await.is_empty());
+    bridge_server.abort();
+    origin_server.abort();
+}
+
+#[tokio::test]
+async fn aggregates_split_buffered_sse_output_items_in_order() {
     let sse = concat!(
         "event: response.created\r\n",
         "data: {\"type\":\"response.created\"}\r\n\r\n",
@@ -826,10 +911,10 @@ async fn aggregates_split_hindsight_sse_output_items_in_order() {
         .chunks(17)
         .map(Bytes::copy_from_slice)
         .collect();
-    let (origin, _, origin_server) = start_hindsight_origin(StatusCode::OK, chunks).await;
+    let (origin, _, origin_server) = start_buffered_origin(StatusCode::OK, chunks).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let response = Client::new()
-        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
         .json(&json!({"model": "gpt-5.4", "input": "hello", "stream": false}))
         .send()
         .await
@@ -894,10 +979,10 @@ async fn preserves_incomplete_and_failed_terminal_responses() {
         let body =
             format!("event: {event}\ndata: {{\"type\":\"{event}\",\"response\":{response}}}\n\n");
         let (origin, _, origin_server) =
-            start_hindsight_origin(StatusCode::OK, vec![Bytes::from(body)]).await;
+            start_buffered_origin(StatusCode::OK, vec![Bytes::from(body)]).await;
         let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
         let received = Client::new()
-            .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+            .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
             .json(&json!({"model": "gpt-5.4", "input": "hello"}))
             .send()
             .await
@@ -913,15 +998,15 @@ async fn preserves_incomplete_and_failed_terminal_responses() {
 }
 
 #[tokio::test]
-async fn preserves_safe_non_successful_hindsight_upstream_responses() {
-    let (origin, _, origin_server) = start_hindsight_origin(
+async fn preserves_safe_non_successful_buffered_upstream_responses() {
+    let (origin, _, origin_server) = start_buffered_origin(
         StatusCode::UNPROCESSABLE_ENTITY,
         vec![Bytes::from_static(b"upstream validation error")],
     )
     .await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let response = Client::new()
-        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
         .json(&json!({
             "model": "gpt-5.4",
             "input": "hello",
@@ -947,11 +1032,11 @@ async fn preserves_safe_non_successful_hindsight_upstream_responses() {
 }
 
 #[tokio::test]
-async fn retries_managed_auth_once_for_hindsight_requests() {
+async fn retries_managed_auth_once_for_buffered_requests() {
     let (origin, requests, origin_server) = start_recording_origin(true, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let response = Client::new()
-        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
         .header("authorization", "Bearer peer-secret")
         .json(&json!({"model": "gpt-5.4", "input": "hello"}))
         .send()
@@ -972,11 +1057,11 @@ async fn retries_managed_auth_once_for_hindsight_requests() {
 }
 
 #[tokio::test]
-async fn keeps_the_existing_request_limit_for_hindsight_requests() {
+async fn keeps_the_existing_request_limit_for_buffered_requests() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let response = Client::new()
-        .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
         .json(&json!({"model": "gpt-5.4", "input": "x".repeat(4 * 1024 * 1024)}))
         .send()
         .await
@@ -989,7 +1074,7 @@ async fn keeps_the_existing_request_limit_for_hindsight_requests() {
 }
 
 #[tokio::test]
-async fn rejects_malformed_oversized_and_unterminated_hindsight_streams() {
+async fn rejects_malformed_oversized_and_unterminated_buffered_streams() {
     let failures = [
         vec![Bytes::from_static(
             b"event: response.completed\ndata: {\"type\":\"response.completed\"\n\n",
@@ -1003,10 +1088,10 @@ async fn rejects_malformed_oversized_and_unterminated_hindsight_streams() {
         vec![Bytes::from(vec![b'x'; 4 * 1024 * 1024 + 1])],
     ];
     for chunks in failures {
-        let (origin, _, origin_server) = start_hindsight_origin(StatusCode::OK, chunks).await;
+        let (origin, _, origin_server) = start_buffered_origin(StatusCode::OK, chunks).await;
         let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
         let response = Client::new()
-            .post(url.replace(ENDPOINT, HINDSIGHT_RESPONSES_ENDPOINT))
+            .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
             .json(&json!({"model": "gpt-5.4", "input": "do not expose this"}))
             .send()
             .await
@@ -1046,12 +1131,15 @@ async fn relays_redirect_response_without_following_it() {
 async fn unsupported_route_remains_absent() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
-    let response = Client::new()
-        .post(url.replace(ENDPOINT, "/codex/unsupported"))
-        .send()
-        .await
-        .expect("unsupported response");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let client = Client::new();
+    for path in ["/codex/unsupported", "/hindsight/responses"] {
+        let response = client
+            .post(url.replace(ENDPOINT, path))
+            .send()
+            .await
+            .expect("unsupported response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
     assert!(requests.lock().await.is_empty());
     bridge_server.abort();
     origin_server.abort();

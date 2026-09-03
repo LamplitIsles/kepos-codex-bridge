@@ -36,16 +36,17 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 pub const ENDPOINT: &str = "/codex/responses";
-pub const HINDSIGHT_RESPONSES_ENDPOINT: &str = "/hindsight/responses";
+pub const BUFFERED_RESPONSES_ENDPOINT: &str = "/codex/buffered-responses";
 pub const IMAGE_ENDPOINT: &str = "/codex/images";
 pub const WEB_SEARCH_ENDPOINT: &str = "/codex/web-search";
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-const MAX_HINDSIGHT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WEB_SEARCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGE_MODEL: &str = "gpt-image-2";
+const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const WEB_SEARCH_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -108,8 +109,8 @@ impl Bridge {
                     .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
             .route(
-                HINDSIGHT_RESPONSES_ENDPOINT,
-                post(hindsight_responses).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
+                BUFFERED_RESPONSES_ENDPOINT,
+                post(buffered_responses).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)),
             )
             .route(
                 IMAGE_ENDPOINT,
@@ -444,40 +445,61 @@ async fn http_responses(
     }
 }
 
-async fn hindsight_responses(
+async fn buffered_responses(
     State(bridge): State<Arc<Bridge>>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (body, ignored_max_output_tokens) = match adapt_hindsight_request(&body) {
+    let (body, ignored_max_output_tokens) = match adapt_buffered_request(&body) {
         Ok(request) => request,
         Err(()) => {
             return (
                 StatusCode::BAD_REQUEST,
-                "invalid Hindsight Responses request",
+                "invalid buffered Responses request",
             )
                 .into_response();
         }
     };
     if ignored_max_output_tokens {
         tracing::warn!(
-            route = HINDSIGHT_RESPONSES_ENDPOINT,
+            route = BUFFERED_RESPONSES_ENDPOINT,
             parameter = "max_output_tokens"
         );
     }
     let response = match bridge.forward_response(&uri, &headers, body).await {
         Ok(upstream) if !upstream.status().is_success() => relay_response(upstream),
-        Ok(upstream) => adapt_hindsight_response(upstream).await,
+        Ok(upstream) => adapt_buffered_response(upstream).await,
         Err(()) => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
     };
-    decorate_hindsight_response(response, ignored_max_output_tokens)
+    decorate_buffered_response(response, ignored_max_output_tokens)
 }
 
-fn adapt_hindsight_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
+fn adapt_buffered_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
     let mut request: Value = serde_json::from_slice(raw).map_err(|_| ())?;
     let request = request.as_object_mut().ok_or(())?;
+    if request.contains_key("tools")
+        || request.contains_key("previous_response_id")
+        || request
+            .get("stream")
+            .is_some_and(|stream| stream.as_bool() == Some(true))
+    {
+        return Err(());
+    }
     let ignored_max_output_tokens = request.remove("max_output_tokens").is_some();
+    if request.get("model").and_then(Value::as_str) == Some(SPARK_MODEL) {
+        let remove_reasoning = request
+            .get_mut("reasoning")
+            .and_then(Value::as_object_mut)
+            .map(|reasoning| {
+                reasoning.remove("summary");
+                reasoning.is_empty()
+            })
+            .unwrap_or(false);
+        if remove_reasoning {
+            request.remove("reasoning");
+        }
+    }
     request.insert("stream".to_owned(), Value::Bool(true));
     serde_json::to_vec(&request)
         .map(Bytes::from)
@@ -485,10 +507,10 @@ fn adapt_hindsight_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
         .map_err(|_| ())
 }
 
-async fn adapt_hindsight_response(upstream: reqwest::Response) -> Response {
+async fn adapt_buffered_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let mut headers = safe_response_headers(upstream.headers());
-    let response = read_hindsight_response_stream(upstream).await;
+    let response = read_buffered_response_stream(upstream).await;
     let response = match response {
         Ok(response) => response,
         Err(()) => {
@@ -516,10 +538,7 @@ async fn adapt_hindsight_response(upstream: reqwest::Response) -> Response {
         .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
 }
 
-fn decorate_hindsight_response(
-    mut response: Response,
-    ignored_max_output_tokens: bool,
-) -> Response {
+fn decorate_buffered_response(mut response: Response, ignored_max_output_tokens: bool) -> Response {
     if ignored_max_output_tokens {
         response.headers_mut().insert(
             "x-kepos-ignored-parameters",
@@ -529,21 +548,21 @@ fn decorate_hindsight_response(
     response
 }
 
-async fn read_hindsight_response_stream(upstream: reqwest::Response) -> Result<Value, ()> {
+async fn read_buffered_response_stream(upstream: reqwest::Response) -> Result<Value, ()> {
     let mut body = Vec::new();
     let mut stream = upstream.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| ())?;
         let length = body.len().checked_add(chunk.len()).ok_or(())?;
-        if length > MAX_HINDSIGHT_RESPONSE_BYTES {
+        if length > MAX_BUFFERED_RESPONSE_BYTES {
             return Err(());
         }
         body.extend_from_slice(&chunk);
     }
-    aggregate_hindsight_sse(&body)
+    aggregate_buffered_sse(&body)
 }
 
-fn aggregate_hindsight_sse(body: &[u8]) -> Result<Value, ()> {
+fn aggregate_buffered_sse(body: &[u8]) -> Result<Value, ()> {
     let text = std::str::from_utf8(body).map_err(|_| ())?;
     let normalized = text.replace("\r\n", "\n");
     let mut output_items = BTreeMap::new();
@@ -568,7 +587,7 @@ fn aggregate_hindsight_sse(body: &[u8]) -> Result<Value, ()> {
             continue;
         }
         let data = data.join("\n");
-        let named_type = event_name.filter(|name| is_hindsight_response_event(name));
+        let named_type = event_name.filter(|name| is_buffered_response_event(name));
         if data.trim() == "[DONE]" {
             if named_type.is_some() {
                 return Err(());
@@ -578,14 +597,14 @@ fn aggregate_hindsight_sse(body: &[u8]) -> Result<Value, ()> {
         let parsed = serde_json::from_str::<Value>(&data);
         let value = match parsed {
             Ok(value) => value,
-            Err(_) if named_type.is_some() || looks_like_hindsight_response_payload(&data) => {
+            Err(_) if named_type.is_some() || looks_like_buffered_response_payload(&data) => {
                 return Err(());
             }
             Err(_) => continue,
         };
         let data_type = value.get("type").and_then(Value::as_str);
         let event_type = data_type
-            .filter(|name| is_hindsight_response_event(name))
+            .filter(|name| is_buffered_response_event(name))
             .or(named_type);
         let Some(event_type) = event_type else {
             continue;
@@ -625,7 +644,7 @@ fn aggregate_hindsight_sse(body: &[u8]) -> Result<Value, ()> {
     Ok(terminal)
 }
 
-fn is_hindsight_response_event(name: &str) -> bool {
+fn is_buffered_response_event(name: &str) -> bool {
     matches!(
         name,
         "response.output_item.done"
@@ -635,7 +654,7 @@ fn is_hindsight_response_event(name: &str) -> bool {
     )
 }
 
-fn looks_like_hindsight_response_payload(data: &str) -> bool {
+fn looks_like_buffered_response_payload(data: &str) -> bool {
     let data = data.trim_start();
     if !data.starts_with('{') || !data.contains("\"type\"") {
         return false;
