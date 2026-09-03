@@ -19,7 +19,7 @@ The bridge publishes four fixed sibling routes:
   `{ "prompt": string, "images"?: string[] }`, a 32 MiB encoded limit, and
   exactly `{ "image_url": "data:image/png;base64,..." }`. A prompt alone
   generates; one through five `data:image/...` inputs edit.
-- `POST /codex/buffered-responses` accepts one caller-supplied, non-streaming,
+- `POST /codex/buffered/responses` accepts one caller-supplied, non-streaming,
   no-tools Responses request. It retains the 4 MiB encoded request limit,
   replaces peer identity with managed OAuth, forces the Codex upstream request
   to stream, and returns one buffered `application/json` Responses object. It
@@ -61,7 +61,7 @@ the bridge's managed bearer/account identity. A pre-stream or pre-upgrade
 upstream 401 receives one managed-OAuth refresh retry. The relay never exposes
 upstream cookies or manufactures SSE events, Responses IDs, or protocol state.
 
-`/codex/buffered-responses` is intentionally the exception to the transparent
+`/codex/buffered/responses` is intentionally the exception to the transparent
 relay's JSON-opaque contract. It preserves every compatible request field while
 performing only the documented transport and Spark normalizations. For a
 successful upstream SSE response, it buffers at most 4 MiB, rebuilds ordered
@@ -75,7 +75,7 @@ use `/codex/responses`.
 
 There is no `/v1` alias, `/compact` route, model alias, client-facing mode
 switch, or fixed `--model`/`--instructions` serve option. In particular,
-`/codex/buffered-responses` is not a generic OpenAI Responses compatibility API.
+`/codex/buffered/responses` is not a generic OpenAI Responses compatibility API.
 Model and instructions belong to the caller. `/codex/images` remains a fixed
 capability, not a generic Images API.
 
@@ -121,7 +121,7 @@ public keys authorized to use the bridge subscription:
 ```text
 service name: codex-bridge
 publisher target: http://127.0.0.1:8787
-paths: /codex/responses, /codex/buffered-responses, /codex/images, and /codex/web-search
+paths: /codex/responses, /codex/buffered/responses, /codex/images, and /codex/web-search
 transport: standard Kepos HTTP service (HTTP + WebSocket upgrade for Responses)
 allowlist: approved peer public keys
 ```
