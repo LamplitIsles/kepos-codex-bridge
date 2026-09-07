@@ -850,16 +850,29 @@ async fn normalizes_spark_reasoning_without_leaving_empty_reasoning() {
 }
 
 #[tokio::test]
-async fn rejects_tools_continuation_and_caller_streaming_before_forwarding() {
+async fn forwards_tools_but_rejects_continuation_and_caller_streaming() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
     let client = Client::new();
-    for request in [
-        json!({
+
+    let response = client
+        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
+        .json(&json!({
             "model": "gpt-5.6-sol",
             "input": "tool request",
-            "tools": [{"type": "function", "name": "lookup"}]
-        }),
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }))
+        .send()
+        .await
+        .expect("buffered tool response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for request in [
         json!({
             "model": "gpt-5.6-sol",
             "input": "continuation request",
@@ -883,7 +896,22 @@ async fn rejects_tools_continuation_and_caller_streaming_before_forwarding() {
             "invalid buffered Responses request"
         );
     }
-    assert!(requests.lock().await.is_empty());
+    let calls = requests.lock().await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&calls[0].body).expect("forwarded tool request"),
+        json!({
+            "model": "gpt-5.6-sol",
+            "input": "tool request",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "stream": true
+        })
+    );
     bridge_server.abort();
     origin_server.abort();
 }

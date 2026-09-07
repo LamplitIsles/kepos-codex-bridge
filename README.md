@@ -19,8 +19,9 @@ The bridge publishes four fixed sibling routes:
   `{ "prompt": string, "images"?: string[] }`, a 32 MiB encoded limit, and
   exactly `{ "image_url": "data:image/png;base64,..." }`. A prompt alone
   generates; one through five `data:image/...` inputs edit.
-- `POST /codex/buffered/responses` accepts one caller-supplied, non-streaming,
-  no-tools Responses request. It retains the 4 MiB encoded request limit,
+- `POST /codex/buffered/responses` accepts one caller-supplied, non-streaming
+  Responses request, including caller-supplied tool definitions. It retains the
+  4 MiB encoded request limit,
   replaces peer identity with managed OAuth, forces the Codex upstream request
   to stream, and returns one buffered `application/json` Responses object. It
   removes `max_output_tokens`; when it does, the response includes
@@ -28,8 +29,10 @@ The bridge publishes four fixed sibling routes:
   before or after generation. For the exact
   `gpt-5.3-codex-spark` model, it also removes `reasoning.summary` (and an
   empty `reasoning` object); other models, including Luna, retain that field.
-  Requests with tools, `previous_response_id`, or `stream: true` are rejected;
-  those workflows continue to use `/codex/responses`.
+  Requests with `previous_response_id` or `stream: true` are rejected. The
+  adapter forwards tool definitions and preserves returned function calls, but
+  the caller remains responsible for executing tools and supplying subsequent
+  tool output.
 - `POST /codex/web-search` is a stateless text-search adapter. It accepts only
   `{ "commands": { ... } }` with one or more of `search_query` (one to three
   queries), `weather`, `sports` (exactly one operation), `finance`, and `time`.
@@ -70,8 +73,8 @@ terminal `response.completed`, `response.incomplete`, or `response.failed`
 object. It does not stream downstream, and it returns a generic 502 without
 partial data when the successful SSE stream is oversized, malformed, or lacks a
 terminal response. Non-successful upstream HTTP statuses and safe headers/bodies
-remain recognizable. Streaming, tools, and continuation workflows continue to
-use `/codex/responses`.
+remain recognizable. Downstream streaming and provider-managed continuation
+workflows continue to use `/codex/responses`.
 
 There is no `/v1` alias, `/compact` route, model alias, client-facing mode
 switch, or fixed `--model`/`--instructions` serve option. In particular,

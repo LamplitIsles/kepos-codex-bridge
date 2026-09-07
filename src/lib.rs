@@ -478,8 +478,7 @@ async fn buffered_responses(
 fn adapt_buffered_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
     let mut request: Value = serde_json::from_slice(raw).map_err(|_| ())?;
     let request = request.as_object_mut().ok_or(())?;
-    if request.contains_key("tools")
-        || request.contains_key("previous_response_id")
+    if request.contains_key("previous_response_id")
         || request
             .get("stream")
             .is_some_and(|stream| stream.as_bool() == Some(true))
