@@ -16,9 +16,11 @@ The bridge publishes four fixed sibling routes:
   query and application headers, forwards Text and Binary frames unchanged,
   propagates Close, and lets the endpoint libraries handle Ping/Pong.
 - `POST /codex/images` retains the existing fixed image capability: JSON
-  `{ "prompt": string, "images"?: string[] }`, a 32 MiB encoded limit, and
-  exactly `{ "image_url": "data:image/png;base64,..." }`. A prompt alone
-  generates; one through five `data:image/...` inputs edit.
+  `{ "model": string, "prompt": string, "images"?: string[] }`, where
+  `model` is required, nonblank, and forwarded exactly to the managed
+  upstream. It retains a 32 MiB encoded limit and returns exactly
+  `{ "image_url": "data:image/png;base64,..." }`. A prompt alone generates;
+  one through five `data:image/...` inputs edit.
 - `POST /codex/buffered/responses` accepts one caller-supplied, non-streaming
   Responses request, including caller-supplied tool definitions. It retains the
   4 MiB encoded request limit,
@@ -80,7 +82,10 @@ There is no `/v1` alias, `/compact` route, model alias, client-facing mode
 switch, or fixed `--model`/`--instructions` serve option. In particular,
 `/codex/buffered/responses` is not a generic OpenAI Responses compatibility API.
 Model and instructions belong to the caller. `/codex/images` remains a fixed
-capability, not a generic Images API.
+transport capability, not a generic Images API: the bridge does not choose,
+allowlist, or default image models. The paired DSH imagegen consumer owns its
+generation/edit model policy and must send the required field, so update both
+sides together before deployment.
 
 ## Build
 

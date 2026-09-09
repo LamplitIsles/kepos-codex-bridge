@@ -45,7 +45,6 @@ const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WEB_SEARCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
-const IMAGE_MODEL: &str = "gpt-image-2";
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
@@ -261,7 +260,7 @@ impl Bridge {
             json!({
                 "prompt": operation.prompt,
                 "background": "auto",
-                "model": IMAGE_MODEL,
+                "model": operation.model,
                 "quality": "auto",
                 "size": "auto"
             })
@@ -270,7 +269,7 @@ impl Bridge {
                 "images": operation.images.iter().map(|image| json!({ "image_url": image })).collect::<Vec<_>>(),
                 "prompt": operation.prompt,
                 "background": "auto",
-                "model": IMAGE_MODEL,
+                "model": operation.model,
                 "quality": "auto",
                 "size": "auto"
             })
@@ -884,6 +883,7 @@ fn to_downstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 
 #[derive(Debug, Deserialize)]
 struct ImageWireRequest {
+    model: String,
     prompt: String,
     #[serde(default)]
     images: Vec<String>,
@@ -892,6 +892,7 @@ struct ImageWireRequest {
 }
 
 struct ImageOperation {
+    model: String,
     prompt: String,
     images: Vec<String>,
 }
@@ -920,6 +921,9 @@ fn parse_image_request(headers: &HeaderMap, raw: &[u8]) -> Result<ImageOperation
     if request.prompt.trim().is_empty() {
         return Err("prompt must not be blank");
     }
+    if request.model.trim().is_empty() {
+        return Err("model must not be blank");
+    }
     if request.images.len() > MAX_EDIT_IMAGES {
         return Err("images must contain at most five inputs");
     }
@@ -927,6 +931,7 @@ fn parse_image_request(headers: &HeaderMap, raw: &[u8]) -> Result<ImageOperation
         return Err("images must be data:image URLs");
     }
     Ok(ImageOperation {
+        model: request.model,
         prompt: request.prompt,
         images: request.images,
     })

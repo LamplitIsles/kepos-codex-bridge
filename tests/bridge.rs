@@ -1618,7 +1618,7 @@ async fn start_image_origin(
 }
 
 #[tokio::test]
-async fn fixed_image_endpoint_remains_unchanged() {
+async fn image_generation_forwards_model_and_managed_identity() {
     let (image_base, calls, origin_server) = start_image_origin(false).await;
     let (url, bridge_server) = start_bridge(
         managed_auth(),
@@ -1628,7 +1628,7 @@ async fn fixed_image_endpoint_remains_unchanged() {
     .await;
     let response = Client::new()
         .post(url.replace(ENDPOINT, IMAGE_ENDPOINT))
-        .json(&json!({"prompt":"draw","api_key":"peer-secret"}))
+        .json(&json!({"model":"gpt-image-2","prompt":"draw","api_key":"peer-secret"}))
         .send()
         .await
         .expect("image relay");
@@ -1640,6 +1640,7 @@ async fn fixed_image_endpoint_remains_unchanged() {
     let calls = calls.lock().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, "/images/generations");
+    assert_eq!(calls[0].2["model"], "gpt-image-2");
     assert!(calls[0].2.get("api_key").is_none());
     assert_eq!(calls[0].1["authorization"], "Bearer managed-stale");
     assert_eq!(calls[0].1["chatgpt-account-id"], "managed-account");
@@ -1648,7 +1649,7 @@ async fn fixed_image_endpoint_remains_unchanged() {
 }
 
 #[tokio::test]
-async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
+async fn image_edits_preserve_limits_and_generic_errors() {
     let (image_base, calls, origin_server) = start_image_origin(false).await;
     let (url, bridge_server) = start_bridge(
         managed_auth(),
@@ -1662,15 +1663,20 @@ async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
         .collect::<Vec<_>>();
     let response = Client::new()
         .post(&image_url)
-        .json(&json!({"prompt":"edit","images":images}))
+        .json(&json!({"model":"future-image-model-2099","prompt":"edit","images":images}))
         .send()
         .await
         .expect("image edit");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(calls.lock().await[0].0, "/images/edits");
+    {
+        let calls = calls.lock().await;
+        assert_eq!(calls[0].0, "/images/edits");
+        assert_eq!(calls[0].2["model"], "future-image-model-2099");
+    }
+    let calls_before_invalid = calls.lock().await.len();
     for invalid in [
-        json!({"prompt":"six","images":["data:image/png;base64,A","data:image/png;base64,B","data:image/png;base64,C","data:image/png;base64,D","data:image/png;base64,E","data:image/png;base64,F"]}),
-        json!({"prompt":"remote","images":["https://example.test/image.png"]}),
+        json!({"model":"future-image-model-2099","prompt":"six","images":["data:image/png;base64,A","data:image/png;base64,B","data:image/png;base64,C","data:image/png;base64,D","data:image/png;base64,E","data:image/png;base64,F"]}),
+        json!({"model":"future-image-model-2099","prompt":"remote","images":["https://example.test/image.png"]}),
     ] {
         let response = Client::new()
             .post(&image_url)
@@ -1687,6 +1693,7 @@ async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
                 .contains("invalid_request_error")
         );
     }
+    assert_eq!(calls.lock().await.len(), calls_before_invalid);
     bridge_server.abort();
     origin_server.abort();
 
@@ -1700,7 +1707,7 @@ async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
     let response = Client::new()
         .post(url.replace(ENDPOINT, IMAGE_ENDPOINT))
         .header("content-type", "application/json")
-        .body(r#"{"prompt":"do-not-echo-this"}"#)
+        .body(r#"{"model":"gpt-image-2","prompt":"do-not-echo-this"}"#)
         .send()
         .await
         .expect("image upstream failure");
@@ -1710,4 +1717,40 @@ async fn fixed_image_edit_limit_and_generic_errors_remain_unchanged() {
     assert!(!body.contains("do-not-echo-this"));
     bridge_server.abort();
     failing_origin.abort();
+}
+
+#[tokio::test]
+async fn invalid_image_models_fail_before_upstream_access() {
+    let (image_base, calls, origin_server) = start_image_origin(false).await;
+    let (url, bridge_server) = start_bridge(
+        managed_auth(),
+        "http://127.0.0.1:1".to_owned(),
+        Some(image_base),
+    )
+    .await;
+    let image_url = url.replace(ENDPOINT, IMAGE_ENDPOINT);
+    for invalid in [
+        json!({"prompt":"missing model"}),
+        json!({"model":42,"prompt":"non-string model"}),
+        json!({"model":"","prompt":"empty model"}),
+        json!({"model":" \t\n","prompt":"whitespace model"}),
+    ] {
+        let response = Client::new()
+            .post(&image_url)
+            .json(&invalid)
+            .send()
+            .await
+            .expect("invalid image model");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("invalid model body")
+                .contains("invalid_request_error")
+        );
+    }
+    assert!(calls.lock().await.is_empty());
+    bridge_server.abort();
+    origin_server.abort();
 }

@@ -17,3 +17,11 @@ rejected.
 **Caller request** — The Responses request supplied by an integration. The
 adapter preserves its compatible fields except for documented upstream
 normalizations.
+
+**Image model responsibility split** — `POST /codex/images` requires a
+nonblank caller-supplied `model` and forwards that identifier unchanged to the
+managed image upstream. The bridge owns managed identity, generation/edit
+routing, input limits, fixed image options, and the `image_url` response; the
+calling image tool owns model policy and defaults. The bridge has no image
+model allowlist, default, or compatibility fallback, so paired callers must
+send the field before this route is deployed with them.
