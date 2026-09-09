@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
@@ -172,6 +172,7 @@ async fn start_recording_origin(
             listener,
             axum::Router::new()
                 .route("/responses", post(recording_responses))
+                .layer(DefaultBodyLimit::disable())
                 .with_state(state),
         )
         .await
@@ -1085,18 +1086,59 @@ async fn retries_managed_auth_once_for_buffered_requests() {
 }
 
 #[tokio::test]
-async fn keeps_the_existing_request_limit_for_buffered_requests() {
+async fn responses_accept_image_history_above_the_old_request_limit() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
-    let response = Client::new()
-        .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
-        .json(&json!({"model": "gpt-5.4", "input": "x".repeat(4 * 1024 * 1024)}))
-        .send()
-        .await
-        .expect("limited response");
+    let image = format!("data:image/png;base64,{}", "AAAA".repeat(1024 * 1024));
+    let request = json!({
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": image},
+            {"type": "input_image", "image_url": image},
+            {"type": "input_text", "text": "continue"}
+        ]}]
+    });
+    let body = serde_json::to_vec(&request).expect("image request");
+    for endpoint in [ENDPOINT, BUFFERED_RESPONSES_ENDPOINT] {
+        let response = Client::new()
+            .post(url.replace(ENDPOINT, endpoint))
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .expect("image history response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let recorded = requests.lock().await.pop().expect("upstream request");
+        if endpoint == ENDPOINT {
+            assert_eq!(recorded.body, body);
+        } else {
+            let mut expected = request.clone();
+            expected["stream"] = json!(true);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&recorded.body).unwrap(),
+                expected
+            );
+        }
+    }
+    bridge_server.abort();
+    origin_server.abort();
+}
 
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(requests.lock().await.is_empty());
+#[tokio::test]
+async fn responses_reject_requests_above_64_mib_before_upstream_contact() {
+    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
+    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
+    let body = Bytes::from(vec![b' '; 64 * 1024 * 1024 + 1]);
+    for endpoint in [ENDPOINT, BUFFERED_RESPONSES_ENDPOINT] {
+        let response = Client::new()
+            .post(url.replace(ENDPOINT, endpoint))
+            .body(body.clone())
+            .send()
+            .await
+            .expect("limited response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(requests.lock().await.is_empty());
+    }
     bridge_server.abort();
     origin_server.abort();
 }

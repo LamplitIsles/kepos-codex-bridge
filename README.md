@@ -10,7 +10,7 @@ history, Lite rendering, cache lineage, continuations, tools, and compaction.
 The bridge publishes four fixed sibling routes:
 
 - `POST /codex/responses` forwards an HTTP/SSE Responses request. It retains a
-  4 MiB encoded request limit and streams the final upstream status, safe
+  64 MiB encoded request limit and streams the final upstream status, safe
   end-to-end headers, and bytes unchanged.
 - `GET /codex/responses` accepts a WebSocket upgrade. It retains the client
   query and application headers, forwards Text and Binary frames unchanged,
@@ -23,7 +23,7 @@ The bridge publishes four fixed sibling routes:
   one through five `data:image/...` inputs edit.
 - `POST /codex/buffered/responses` accepts one caller-supplied, non-streaming
   Responses request, including caller-supplied tool definitions. It retains the
-  4 MiB encoded request limit,
+  64 MiB encoded request limit,
   replaces peer identity with managed OAuth, forces the Codex upstream request
   to stream, and returns one buffered `application/json` Responses object. It
   removes `max_output_tokens`; when it does, the response includes
