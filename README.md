@@ -119,6 +119,26 @@ kepos-codex-bridge login --auth-file "$KEPOS_CODEX_AUTH_FILE"
 kepos-codex-bridge serve --auth-file "$KEPOS_CODEX_AUTH_FILE" --port 8787
 ```
 
+The bridge follows the same environment proxy policy as its HTTP client for
+upstream Responses traffic. Set the variables before starting `serve`:
+
+- `HTTPS_PROXY`/`https_proxy` is used for `wss` upstreams, with
+  `ALL_PROXY`/`all_proxy` as a fallback.
+- `HTTP_PROXY`/`http_proxy` is used for `ws` upstreams, with
+  `ALL_PROXY`/`all_proxy` as a fallback.
+- `NO_PROXY`/`no_proxy` uses the standard comma-separated host, domain, IP,
+  CIDR, and `*` bypass rules. The uppercase variable wins when both cases are
+  set, matching the HTTP route.
+
+Proxy URLs must name an HTTP CONNECT proxy. A WebSocket connection reports a
+generic 502 when the proxy, TCP/TLS path, or upstream upgrade cannot be
+established; the complete establishment attempt, including the one managed
+OAuth refresh retry, is bounded at 15 seconds. Once upgraded, the Responses
+stream remains long-lived and the relay's existing opaque frame, header,
+subprotocol, and managed-identity behavior is unchanged. The proxy policy is
+read when the bridge starts, so change the environment and restart the bridge
+when changing egress policy.
+
 The listener is `127.0.0.1:8787` by default. It does not terminate TLS or
 publish login, token inspection, logout, metrics, or admin endpoints.
 
@@ -139,6 +159,11 @@ An allowed peer can use the bridge account, so do not publish this service to
 untrusted peers. The bridge adds no bearer authentication, account
 multiplexing, token inspection, request-body logging, conversation persistence,
 or prompt-cache registry.
+
+The implementation artifact is published by the repository's CI workflow after
+the feature is merged to `main`; merging does not restart an existing Bridge
+Pod. Any production image rollout or restart remains a separate operator
+approval and deployment step.
 
 ## Test-owned client setup
 

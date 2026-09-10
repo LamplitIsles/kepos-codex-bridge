@@ -3,8 +3,13 @@
 //! The bridge owns only the ChatGPT OAuth credential. Responses request and
 //! response protocol state belongs entirely to the connected client.
 
-use std::{collections::BTreeMap, marker::PhantomData, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, io, marker::PhantomData, net::SocketAddr, sync::Arc, time::Duration,
+};
 
+use async_http_proxy::{
+    HttpError as HttpProxyError, http_connect_tokio, http_connect_tokio_with_basic_auth,
+};
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -14,7 +19,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{SinkExt, StreamExt};
+use hyper_util::client::proxy::matcher::{Intercept, Matcher};
 use nanocodex_oai_api::{
     MODEL as NANOCODEX_MODEL,
     auth::{OpenAiAuth, OpenAiAuthMode, OpenAiAuthSnapshot},
@@ -27,7 +34,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{
         Error as WebSocketError, Message as TungsteniteMessage, client::IntoClientRequest,
         protocol::CloseFrame as TungsteniteCloseFrame,
@@ -47,6 +54,7 @@ const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
 const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
+const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const WEB_SEARCH_RETRY_DELAY: Duration = Duration::from_millis(200);
 
@@ -59,6 +67,7 @@ pub struct Bridge {
     web_search_client: reqwest::Client,
     image_api_base_url: Arc<str>,
     responses_api_base_url: Arc<str>,
+    websocket_proxy_matcher: Arc<Matcher>,
 }
 
 impl Bridge {
@@ -80,6 +89,7 @@ impl Bridge {
                 .expect("web search client configuration is valid"),
             image_api_base_url: base_url.clone(),
             responses_api_base_url: base_url,
+            websocket_proxy_matcher: Arc::new(Matcher::from_env()),
         }
     }
 
@@ -94,6 +104,12 @@ impl Bridge {
     #[must_use]
     pub fn with_responses_api_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
         self.responses_api_base_url = base_url.into();
+        self
+    }
+
+    #[cfg(test)]
+    fn with_websocket_proxy_matcher_for_test(mut self, matcher: Matcher) -> Self {
+        self.websocket_proxy_matcher = Arc::new(matcher);
         self
     }
 
@@ -182,6 +198,29 @@ impl Bridge {
         uri: &Uri,
         headers: &HeaderMap,
     ) -> Result<(UpstreamWebSocket, HeaderMap, Option<HeaderValue>), ()> {
+        self.connect_websocket_with_timeout(uri, headers, WEBSOCKET_CONNECT_TIMEOUT)
+            .await
+    }
+
+    async fn connect_websocket_with_timeout(
+        &self,
+        uri: &Uri,
+        headers: &HeaderMap,
+        establishment_timeout: Duration,
+    ) -> Result<(UpstreamWebSocket, HeaderMap, Option<HeaderValue>), ()> {
+        timeout(
+            establishment_timeout,
+            self.connect_websocket_with_retry(uri, headers),
+        )
+        .await
+        .map_err(|_| ())?
+    }
+
+    async fn connect_websocket_with_retry(
+        &self,
+        uri: &Uri,
+        headers: &HeaderMap,
+    ) -> Result<(UpstreamWebSocket, HeaderMap, Option<HeaderValue>), ()> {
         let endpoint = response_websocket_endpoint(&self.responses_api_base_url, uri);
         let auth = self.auth.snapshot().await.map_err(|_| ())?;
         match self
@@ -233,7 +272,7 @@ impl Bridge {
                 .headers_mut()
                 .insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
         }
-        let (socket, response) = connect_async(request).await?;
+        let (socket, response) = self.connect_websocket_transport(request).await?;
         let selected_protocol = response
             .headers()
             .get(header::SEC_WEBSOCKET_PROTOCOL)
@@ -243,6 +282,27 @@ impl Bridge {
             safe_websocket_response_headers(response.headers()),
             selected_protocol,
         ))
+    }
+
+    async fn connect_websocket_transport(
+        &self,
+        request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ) -> Result<
+        (
+            UpstreamWebSocket,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        WebSocketError,
+    > {
+        let (target_uri, host, port) = websocket_target(&request)?;
+        let stream = if let Some(proxy) = self.websocket_proxy_matcher.intercept(&target_uri) {
+            connect_via_http_proxy(&proxy, &host, port).await?
+        } else {
+            TcpStream::connect(format!("{host}:{port}"))
+                .await
+                .map_err(WebSocketError::Io)?
+        };
+        client_async_tls_with_config(request, stream, None, None).await
     }
 
     async fn perform_image(&self, operation: ImageOperation) -> Result<String, ()> {
@@ -813,6 +873,97 @@ fn relay_response(upstream: reqwest::Response) -> Response {
 }
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+fn websocket_target(
+    request: &tokio_tungstenite::tungstenite::handshake::client::Request,
+) -> Result<(Uri, String, u16), WebSocketError> {
+    let websocket_uri = request.uri();
+    let (target_scheme, default_port) = match websocket_uri.scheme_str() {
+        Some("ws") => ("http", 80),
+        Some("wss") => ("https", 443),
+        _ => {
+            return Err(invalid_websocket_connection(
+                "unsupported WebSocket URL scheme",
+            ));
+        }
+    };
+    let host = websocket_uri
+        .host()
+        .ok_or_else(|| invalid_websocket_connection("WebSocket URL has no host"))?
+        .to_owned();
+    let port = websocket_uri.port_u16().unwrap_or(default_port);
+    let path_and_query = websocket_uri
+        .path_and_query()
+        .map_or("/", |path_and_query| path_and_query.as_str());
+    let target_uri = Uri::builder()
+        .scheme(target_scheme)
+        .authority(
+            websocket_uri
+                .authority()
+                .ok_or_else(|| invalid_websocket_connection("WebSocket URL has no authority"))?
+                .clone(),
+        )
+        .path_and_query(path_and_query)
+        .build()
+        .map_err(|error| invalid_websocket_connection(error.to_string()))?;
+    Ok((target_uri, host, port))
+}
+
+async fn connect_via_http_proxy(
+    proxy: &Intercept,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream, WebSocketError> {
+    if proxy.uri().scheme_str() != Some("http") {
+        return Err(invalid_websocket_connection(
+            "WebSocket proxy must use an HTTP CONNECT endpoint",
+        ));
+    }
+    let proxy_host = proxy
+        .uri()
+        .host()
+        .ok_or_else(|| invalid_websocket_connection("WebSocket proxy has no host"))?;
+    let proxy_port = proxy.uri().port_u16().unwrap_or(80);
+    let mut stream = TcpStream::connect(format!("{proxy_host}:{proxy_port}"))
+        .await
+        .map_err(WebSocketError::Io)?;
+    if let Some((username, password)) = proxy_basic_credentials(proxy)? {
+        http_connect_tokio_with_basic_auth(&mut stream, host, port, &username, &password)
+            .await
+            .map_err(http_proxy_error)?;
+    } else {
+        http_connect_tokio(&mut stream, host, port)
+            .await
+            .map_err(http_proxy_error)?;
+    }
+    Ok(stream)
+}
+
+fn proxy_basic_credentials(proxy: &Intercept) -> Result<Option<(String, String)>, WebSocketError> {
+    let Some(value) = proxy.basic_auth() else {
+        return Ok(None);
+    };
+    let encoded = value
+        .to_str()
+        .map_err(|_| invalid_websocket_connection("WebSocket proxy credentials are invalid"))?
+        .strip_prefix("Basic ")
+        .ok_or_else(|| invalid_websocket_connection("WebSocket proxy credentials are invalid"))?;
+    let decoded = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid_websocket_connection("WebSocket proxy credentials are invalid"))?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| invalid_websocket_connection("WebSocket proxy credentials are invalid"))?;
+    let (username, password) = decoded.split_once(':').unwrap_or((&decoded, ""));
+    Ok(Some((username.to_owned(), password.to_owned())))
+}
+
+fn http_proxy_error(error: HttpProxyError) -> WebSocketError {
+    invalid_websocket_connection(error.to_string())
+}
+
+fn invalid_websocket_connection(message: impl Into<String>) -> WebSocketError {
+    WebSocketError::Io(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
+}
 
 fn is_unauthorized_websocket_handshake(error: &WebSocketError) -> bool {
     matches!(error, WebSocketError::Http(response) if response.status() == StatusCode::UNAUTHORIZED)
@@ -1518,4 +1669,356 @@ pub enum AuthFileError {
     Permissions,
     #[error("credential file permissions cannot be checked on this platform")]
     UnsupportedPlatform,
+}
+
+#[cfg(test)]
+mod websocket_proxy_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::{SinkExt, StreamExt};
+    use nanocodex_oai_api::auth::{OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthSource};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
+    use tokio_tungstenite::{
+        accept_hdr_async, connect_async,
+        tungstenite::{
+            Message,
+            client::IntoClientRequest,
+            handshake::server::{Request as WebSocketRequest, Response},
+        },
+    };
+
+    struct StaticManagedAuth;
+
+    impl OpenAiAuthSource for StaticManagedAuth {
+        fn validate(&self) -> Result<(), OpenAiAuthError> {
+            Ok(())
+        }
+
+        fn snapshot(&self) -> OpenAiAuthFuture<'_, Result<OpenAiAuthSnapshot, OpenAiAuthError>> {
+            Box::pin(async {
+                Ok(OpenAiAuthSnapshot::new(
+                    OpenAiAuthMode::ChatGpt,
+                    "managed-token",
+                    Some("managed-account"),
+                    true,
+                    0,
+                ))
+            })
+        }
+
+        fn recover_unauthorized(
+            &self,
+            _rejected: &OpenAiAuthSnapshot,
+        ) -> OpenAiAuthFuture<'_, Result<(), OpenAiAuthError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn managed_auth() -> OpenAiAuth {
+        OpenAiAuth::managed_chatgpt(Arc::new(StaticManagedAuth))
+    }
+
+    async fn read_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            assert!(
+                bytes.len() < 8 * 1024,
+                "proxy request headers are too large"
+            );
+            let read = stream
+                .read_buf(&mut bytes)
+                .await
+                .expect("proxy request headers");
+            assert_ne!(read, 0, "proxy closed before request headers");
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    async fn start_connect_proxy(
+        expected_target: String,
+        connections: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("proxy listener");
+        let address = listener.local_addr().expect("proxy address");
+        let task = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.expect("proxy client");
+            let head = read_http_head(&mut client).await;
+            let head = String::from_utf8(head).expect("proxy request is HTTP");
+            assert!(head.starts_with(&format!("CONNECT {expected_target} HTTP/1.1")));
+            connections.fetch_add(1, Ordering::SeqCst);
+            let mut upstream = tokio::net::TcpStream::connect(&expected_target)
+                .await
+                .expect("proxy upstream");
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .expect("proxy CONNECT response");
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .expect("proxy tunnel");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    async fn start_hanging_proxy(
+        disconnected: oneshot::Sender<()>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("hanging proxy listener");
+        let address = listener.local_addr().expect("hanging proxy address");
+        let task = tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.expect("hanging proxy client");
+            let _ = read_http_head(&mut client).await;
+            let mut byte = [0; 1];
+            let _ = client.read(&mut byte).await;
+            disconnected.send(()).expect("disconnect receiver");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn start_origin() -> (String, String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("origin listener");
+        let address = listener.local_addr().expect("origin address");
+        let target = address.to_string();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("origin client");
+            let mut socket = accept_hdr_async(
+                stream,
+                |request: &WebSocketRequest, mut response: Response| {
+                    assert_eq!(request.uri().path(), "/responses");
+                    assert_eq!(request.uri().query(), Some("opaque=query"));
+                    assert_eq!(request.headers()["authorization"], "Bearer managed-token");
+                    assert_eq!(request.headers()["chatgpt-account-id"], "managed-account");
+                    assert_eq!(request.headers()["sec-websocket-protocol"], "bridge-test");
+                    assert!(!request.headers().contains_key("x-api-key"));
+                    assert!(!request.headers().contains_key("cookie"));
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        HeaderValue::from_static("bridge-test"),
+                    );
+                    response
+                        .headers_mut()
+                        .insert("x-origin-semantic", HeaderValue::from_static("kept"));
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("origin WebSocket handshake");
+            assert_eq!(
+                socket
+                    .next()
+                    .await
+                    .expect("origin text")
+                    .expect("origin text message"),
+                Message::Text("client text".into())
+            );
+            assert_eq!(
+                socket
+                    .next()
+                    .await
+                    .expect("origin binary")
+                    .expect("origin binary message"),
+                Message::Binary(vec![0, 255, 42].into())
+            );
+            socket
+                .send(Message::Text("upstream text".into()))
+                .await
+                .expect("origin text response");
+            socket
+                .send(Message::Binary(vec![9, 8, 7].into()))
+                .await
+                .expect("origin binary response");
+            assert!(matches!(
+                socket.next().await.expect("origin close"),
+                Ok(Message::Close(_))
+            ));
+        });
+        (format!("http://{address}"), target, task)
+    }
+
+    fn test_matcher(proxy: &str, no_proxy: Option<&str>) -> Matcher {
+        let mut builder = Matcher::builder().http(proxy).https(proxy);
+        if let Some(no_proxy) = no_proxy {
+            builder = builder.no(no_proxy);
+        }
+        builder.build()
+    }
+
+    async fn start_test_bridge(
+        mut bridge: Bridge,
+        origin: String,
+        matcher: Matcher,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        bridge = bridge
+            .with_responses_api_base_url(origin)
+            .with_websocket_proxy_matcher_for_test(matcher);
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bridge listener");
+        let address = listener.local_addr().expect("bridge address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, bridge.router())
+                .await
+                .expect("bridge server");
+        });
+        (format!("http://{address}{ENDPOINT}"), task)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn websocket_uses_http_connect_proxy_and_preserves_identity_and_frames() {
+        let (origin, target, origin_task) = start_origin().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (proxy, proxy_task) = start_connect_proxy(target, connections.clone()).await;
+        let matcher = test_matcher(&proxy, None);
+        let (bridge, bridge_task) =
+            start_test_bridge(Bridge::new(managed_auth()), origin, matcher).await;
+
+        let mut request = format!("{bridge}?opaque=query")
+            .replacen("http", "ws", 1)
+            .into_client_request()
+            .expect("bridge request");
+        for (name, value) in [
+            ("authorization", "Bearer peer-secret"),
+            ("x-api-key", "peer-api-key"),
+            ("cookie", "peer-cookie=secret"),
+            ("sec-websocket-protocol", "bridge-test"),
+        ] {
+            request
+                .headers_mut()
+                .insert(name, value.parse().expect("client header"));
+        }
+        let (mut socket, response) = connect_async(request)
+            .await
+            .expect("bridge WebSocket handshake");
+        assert_eq!(response.headers()["sec-websocket-protocol"], "bridge-test");
+        assert_eq!(response.headers()["x-origin-semantic"], "kept");
+        socket
+            .send(Message::Text("client text".into()))
+            .await
+            .expect("client text");
+        socket
+            .send(Message::Binary(vec![0, 255, 42].into()))
+            .await
+            .expect("client binary");
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("upstream text")
+                .expect("upstream text message"),
+            Message::Text("upstream text".into())
+        );
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("upstream binary")
+                .expect("upstream binary message"),
+            Message::Binary(vec![9, 8, 7].into())
+        );
+        socket
+            .send(Message::Close(None))
+            .await
+            .expect("client close");
+        origin_task.await.expect("origin result");
+        proxy_task.await.expect("proxy result");
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        bridge_task.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn websocket_no_proxy_bypasses_connect_proxy() {
+        let (origin, target, origin_task) = start_origin().await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (proxy, proxy_task) = start_connect_proxy(target, connections.clone()).await;
+        let matcher = test_matcher(&proxy, Some("127.0.0.1"));
+        let (bridge, bridge_task) =
+            start_test_bridge(Bridge::new(managed_auth()), origin, matcher).await;
+
+        let mut request = format!("{bridge}?opaque=query")
+            .replacen("http", "ws", 1)
+            .into_client_request()
+            .expect("bridge request");
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "bridge-test".parse().unwrap());
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("direct WebSocket handshake");
+        socket
+            .send(Message::Text("client text".into()))
+            .await
+            .expect("client text");
+        socket
+            .send(Message::Binary(vec![0, 255, 42].into()))
+            .await
+            .expect("client binary");
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("upstream text")
+                .expect("upstream text message"),
+            Message::Text("upstream text".into())
+        );
+        assert_eq!(
+            socket
+                .next()
+                .await
+                .expect("upstream binary")
+                .expect("upstream binary message"),
+            Message::Binary(vec![9, 8, 7].into())
+        );
+        socket
+            .send(Message::Close(None))
+            .await
+            .expect("client close");
+        origin_task.await.expect("origin result");
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+        proxy_task.abort();
+        bridge_task.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_establishment_timeout_releases_proxy_socket() {
+        let (disconnected_tx, disconnected_rx) = oneshot::channel();
+        let (proxy, proxy_task) = start_hanging_proxy(disconnected_tx).await;
+        let matcher = test_matcher(&proxy, None);
+        let bridge = Bridge::new(managed_auth())
+            .with_responses_api_base_url("http://127.0.0.1:9")
+            .with_websocket_proxy_matcher_for_test(matcher);
+        let uri = Uri::from_static("/codex/responses");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.connect_websocket_with_timeout(
+                &uri,
+                &HeaderMap::new(),
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("bounded establishment");
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), disconnected_rx)
+            .await
+            .expect("proxy socket cleanup")
+            .expect("proxy cleanup signal");
+        proxy_task.await.expect("proxy result");
+    }
 }
