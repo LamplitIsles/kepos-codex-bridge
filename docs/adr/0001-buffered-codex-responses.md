@@ -20,11 +20,9 @@ Replace the former consumer-specific route with `POST /codex/buffered/responses`
 The endpoint accepts one JSON-object request without `previous_response_id` or
 `stream: true`, makes the upstream request stream,
 and returns the collected terminal response as one standard Responses JSON
-object. The caller supplies the model, so the same contract can serve Luna and
-GPT-5.3-Codex-Spark. It removes `max_output_tokens` for the Codex upstream and,
-for the exact Spark model only, removes `reasoning.summary` and any resulting
-empty `reasoning` object. The transparent `/codex/responses` relay remains the
-route for downstream streaming and provider continuation state.
+object. The caller supplies the model. It removes `max_output_tokens` for the
+Codex upstream. The transparent `/codex/responses` relay remains the route for
+downstream streaming and provider continuation state.
 
 The adapter forwards caller-supplied tool definitions and preserves returned
 function-call output items, but it does not execute tools or emulate provider
@@ -33,6 +31,4 @@ state. It remains a transport adapter rather than a second provider SDK.
 ## Consequences
 
 The old consumer-specific route is removed. Buffered callers share one
-explicitly bounded contract, while the known Spark incompatibility remains a
-documented model-specific normalization rather than a consumer-specific
-adapter.
+explicitly bounded, model-agnostic contract.

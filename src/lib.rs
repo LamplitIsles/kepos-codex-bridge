@@ -52,7 +52,6 @@ const MAX_IMAGE_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_WEB_SEARCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_WEB_SEARCH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_EDIT_IMAGES: usize = 5;
-const SPARK_MODEL: &str = "gpt-5.3-codex-spark";
 const NANOCODEX_USER_AGENT: &str = "nanocodex/0.5.0";
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
@@ -545,19 +544,6 @@ fn adapt_buffered_request(raw: &[u8]) -> Result<(Bytes, bool), ()> {
         return Err(());
     }
     let ignored_max_output_tokens = request.remove("max_output_tokens").is_some();
-    if request.get("model").and_then(Value::as_str) == Some(SPARK_MODEL) {
-        let remove_reasoning = request
-            .get_mut("reasoning")
-            .and_then(Value::as_object_mut)
-            .map(|reasoning| {
-                reasoning.remove("summary");
-                reasoning.is_empty()
-            })
-            .unwrap_or(false);
-        if remove_reasoning {
-            request.remove("reasoning");
-        }
-    }
     request.insert("stream".to_owned(), Value::Bool(true));
     serde_json::to_vec(&request)
         .map(Bytes::from)

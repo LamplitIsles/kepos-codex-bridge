@@ -28,9 +28,7 @@ The bridge publishes four fixed sibling routes:
   to stream, and returns one buffered `application/json` Responses object. It
   removes `max_output_tokens`; when it does, the response includes
   `x-kepos-ignored-parameters: max_output_tokens`; that limit is not enforced
-  before or after generation. For the exact
-  `gpt-5.3-codex-spark` model, it also removes `reasoning.summary` (and an
-  empty `reasoning` object); other models, including Luna, retain that field.
+  before or after generation.
   Requests with `previous_response_id` or `stream: true` are rejected. The
   adapter forwards tool definitions and preserves returned function calls, but
   the caller remains responsible for executing tools and supplying subsequent
@@ -68,7 +66,7 @@ upstream cookies or manufactures SSE events, Responses IDs, or protocol state.
 
 `/codex/buffered/responses` is intentionally the exception to the transparent
 relay's JSON-opaque contract. It preserves every compatible request field while
-performing only the documented transport and Spark normalizations. For a
+performing only the documented transport normalization. For a
 successful upstream SSE response, it buffers at most 4 MiB, rebuilds ordered
 `output` from `response.output_item.done` events, and combines it with the first
 terminal `response.completed`, `response.incomplete`, or `response.failed`

@@ -803,54 +803,6 @@ async fn adapts_luna_buffered_request_and_returns_a_buffered_response() {
 }
 
 #[tokio::test]
-async fn normalizes_spark_reasoning_without_leaving_empty_reasoning() {
-    let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
-    let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
-    let client = Client::new();
-
-    for request in [
-        json!({
-            "model": "gpt-5.3-codex-spark",
-            "input": "summary only",
-            "reasoning": {"summary": "auto"},
-            "stream": false
-        }),
-        json!({
-            "model": "gpt-5.3-codex-spark",
-            "input": "effort and summary",
-            "reasoning": {"effort": "medium", "summary": "auto"}
-        }),
-    ] {
-        let response = client
-            .post(url.replace(ENDPOINT, BUFFERED_RESPONSES_ENDPOINT))
-            .json(&request)
-            .send()
-            .await
-            .expect("Spark buffered response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "application/json");
-        assert!(
-            !response
-                .headers()
-                .contains_key("x-kepos-ignored-parameters")
-        );
-    }
-
-    let calls = requests.lock().await;
-    assert_eq!(calls.len(), 2);
-    let first: Value = serde_json::from_slice(&calls[0].body).expect("first Spark request JSON");
-    assert_eq!(first["model"], "gpt-5.3-codex-spark");
-    assert_eq!(first["input"], "summary only");
-    assert_eq!(first["stream"], true);
-    assert!(first.get("reasoning").is_none());
-    let second: Value = serde_json::from_slice(&calls[1].body).expect("second Spark request JSON");
-    assert_eq!(second["reasoning"], json!({"effort": "medium"}));
-    assert_eq!(second["stream"], true);
-    bridge_server.abort();
-    origin_server.abort();
-}
-
-#[tokio::test]
 async fn forwards_tools_but_rejects_continuation_and_caller_streaming() {
     let (origin, requests, origin_server) = start_recording_origin(false, StatusCode::OK).await;
     let (url, bridge_server) = start_bridge(managed_auth(), origin, None).await;
